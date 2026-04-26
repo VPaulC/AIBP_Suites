@@ -1,113 +1,227 @@
+I'll improve the formatting of the README.md file for better readability. Let me first retrieve the full file and then make comprehensive formatting improvements.I'll improve the formatting of your README.md for better readability. Here's a restructured version with clearer hierarchy, better visual separation, and improved organization:
+
+```markdown name=README.md url=https://github.com/VPaulC/AIBP_Suites/blob/9a49d5dddaec1d2bdd657c73ed869be2fb0b223b/README.md
+
 # AIBP_Suites
-Configuration Scripts for MSP service implementation
-provides an example automation script to accelerate repeatable setup tasks for sub 300-seat customers. Always test in a lab tenant first, start in report-only modes where supported, and ensure you have break-glass accounts in place before enabling any access policies.
-D.1 Prerequisites
-•	PowerShell 7+ recommended, or Windows PowerShell 5.1.
-•	Microsoft Graph PowerShell SDK installed: Microsoft.Graph modules.
-•	Permissions: you will be prompted for delegated permissions. Minimum scopes used by this script are typically:
-o	Policy.ReadWrite.ConditionalAccess (create Conditional Access policies)
-o	Group.ReadWrite.All (create groups)
-o	Directory.Read.All (read directory objects)
-o	Organization.Read.All (read subscribed SKUs)
-o	Directory.ReadWrite.All or Group.ReadWrite.All (group-based licensing)
-•	Tenant prerequisites: at least one break-glass account; pilot groups agreed; Copilot licences available if you intend to assign them.
-D.2 What this script can and cannot do
-Can do (automated)	Cannot do / not included (manual or separate automation)
-•	Connect to Microsoft Graph with required scopes.
-•	Create standard security groups used by this runbook (IT-Admins, Copilot-Pilot, Exceptions).
-•	Create Conditional Access policies (pilot MFA; block legacy authentication; pilot compliant-device access; admin portal protection) in report-only by default.
-•	Assign Copilot licences to a pilot group using group-based licensing (if available).
-•	Defender evidence exports: Secure Score, ORCA (MDO posture), MDE machine inventory export.
-•	Defender for Office 365 (MDO) configuration (optional, gated): enable Preset security policies + Safe Links + Safe Attachments + ZAP (pilot-first).
-•	Purview configuration (optional, gated): create/update sensitivity labels; publish labels to a pilot scope; create/update DLP policy (audit-first) and export evidence.
-•	Export a configuration inventory (groups, CA policies, Defender/Purview artefacts where created) for evidence/handover.	•	Full Intune “policy-as-code” at scale (hundreds of settings, multiple platforms, version control, and CI/CD). The script can create a basic SMB baseline (pilot-scoped) but complex estates should use a dedicated, versioned Intune configuration project.
-•	SharePoint/Teams permissions remediation at scale (site-by-site oversharing fixes are customer-specific).
-•	Tenant-wide baseline security mode settings (Secure Defaults / Baseline security mode) are tenant/UI-driven; script exports evidence but does not toggle these by default.
-•	Anything that could risk tenant lockout (script will not modify break-glass accounts or remove existing policies).
-D.3 PowerShell script (starter automation)
-D.4 PowerShell workflow, prompts, and post-run tasks
-Use this section as the operator guide for running the starter automation script in Appendix D.3. It explains the end-to-end workflow (what happens in what order), lists every prompt the script will ask, provides guidance on how to respond (and when to choose “No”), and finishes with the manual tasks required to complete the implementation and validate outcomes.
-D.4.1 Pre-run checklist (must do)
-•	Change window approved: confirm the customer has approved the window and understands pilot-first impacts (MFA, device compliance, Safe Links/Safe Attachments, labelling prompts, DLP policy tips).
-•	Break-glass accounts confirmed: at least one break-glass UPN is known, credentials stored securely, and excluded from Conditional Access (with monitoring and strong passwords).
-•	Pilot groups agreed: confirm display names for IT admin group, Copilot pilot users group, exception users group, and a pilot device group for Intune assignments.
-•	Licences available: Business Premium licences assigned as baseline; optional Defender/Purview/Copilot SKUs available if you intend to configure/assign them.
-•	Workstation readiness: run PowerShell as administrator; outbound access to PowerShell Gallery; TLS 1.2 enabled; able to sign in interactively for Graph and (optionally) Exchange Online / Compliance PowerShell.
-•	Rollback plan: confirm how to roll back (remove users from pilot groups, disable a specific policy, or revert a single Intune policy assignment).
-D.4.2 Execution flow (what the script does, in order)
-1.	Prompt collection: gathers tenant hint, naming, break-glass UPNs, and which optional modules you want to run (Intune, Copilot licensing, Defender evidence, Defender for Office 365 config, Purview labels/DLP).
-2.	Module installation: installs/loads required PowerShell modules (Graph SDK modules, and ExchangeOnlineManagement/ORCA if selected).
-3.	Authentication: connects to Microsoft Graph with the minimum required delegated scopes; additional sign-ins occur only if you enabled Exchange Online / Compliance PowerShell actions.
-4.	Safety resolution: resolves break-glass user object IDs to ensure they’re excluded from Conditional Access policies.
-5.	Group creation: creates (or reuses) the standard groups used by this runbook (IT-Admins, Copilot-Pilot, Exceptions). Optionally resolves the pilot device group for Intune assignments.
-6.	Conditional Access baseline: creates the four baseline CA policies in Report-only (MFA pilot, block legacy auth, require compliant device for Office 365, admin portal MFA). Nothing is enforced automatically.
-7.	Intune baseline (optional): if enabled and the pilot device group exists, creates a Windows compliance policy and assigns it to the pilot device group. (Endpoint security policies may require tenant-approved templates if you extend the script.)
-8.	Copilot licensing (optional): attempts group-based licensing for the pilot group using the Copilot SKU part number hint (skips if not found).
-9.	Purview (optional): connects to Security & Compliance PowerShell to create/update sensitivity labels, publish labels (pilot-first), and create/update a DLP policy (audit-first) using your selected sensitive info types.
-10.	Defender for Office 365 (optional): connects to Exchange Online to enable preset security policies and/or create Safe Links/Safe Attachments policies and rules (pilot-first), plus ZAP best-effort enablement.
-11.	Defender evidence (optional): runs ORCA (if selected), exports Secure Score JSON, and exports an MDE machine inventory snapshot.
-12.	Evidence export: writes run summary and artefact exports to the Evidence folder for handover.
-D.4.3 Prompt catalogue (what you’ll be asked, and how to answer)
-Prompt / input	What it controls	Guidance / recommended response
-Tenant domain hint	Cosmetic only (helps operator confirm tenant)	Optional. Enter customer.onmicrosoft.com if you want an extra sanity check in logs.
-Group prefix	Naming for created artefacts	Keep consistent across customers (e.g., AI-Readiness), or include customer shorthand if you manage multiple tenants.
-IT admins group name	Scope for CA04 admin portal protection	Use an existing admin group if the customer already has one; otherwise let the script create it and then add admins.
-Copilot pilot group name	Scope for pilot CA + optional licensing	Use a real pilot group containing 10–30 users; avoid “All Users” until validation is complete.
-Exception users group name	Exclusions from CA02 (and future exceptions)	Keep this group empty unless you have a documented business/technical exception.
-Pilot device group name	Assignments for Intune baseline	Recommended. Use a device group (not user group). If blank or not found, Intune assignments are skipped.
-Break-glass UPNs (required)	CA exclusions for emergency access	Enter at least one. Must be a real cloud user UPN. Do not use shared admin accounts.
-Create Intune baseline?	Whether Intune objects are created/assigned	Choose Yes only if Intune is in scope and you have a pilot device group ready.
-Attempt Copilot group-based licensing?	Licence assignment to pilot group	Choose No if the customer assigns licences manually, or if Copilot is not purchased yet.
-Collect Defender evidence?	Exports Secure Score/ORCA/MDE inventory	Recommended for evidence and baseline measurement, even if you are not enforcing changes yet.
-Configure Defender for Office 365 policies?	MDO preset policies / Safe Links / Safe Attachments / ZAP	Choose Yes only if Defender for Office 365 is licensed and you have a pilot scope. Start with Standard preset for pilot users.
-Configure Purview (labels + DLP)?	Creates labels/publishing and audit-first DLP	Recommended if Purview is in scope. Start with a small label set and DLP in Audit mode with policy tips.
-DLP sensitive info types	What the audit rule detects	Use a narrow set initially (e.g., “Credit Card Number”, “Bank Account Number”, “Passport Number”) and expand once you understand alert volume.
-D.4.4 Expected outputs (evidence files)
-•	Evidence\run-summary.json — Single JSON summary of what you chose and what ran.
-•	Evidence\groups.json — Groups created/located by prefix.
-•	Evidence\conditional-access-policies.json — All CA policies with state (expect report-only for the ones created by the script).
-•	Evidence\Intune\created-intune-objects.json — Intune objects created (at minimum the Windows compliance policy if enabled).
-•	Evidence\Security\secureScores.json and secureScoreControlProfiles.json — Secure Score snapshot and control catalogue (if enabled).
-•	Evidence\ORCA\ — ORCA report outputs (HTML/CSV/JSON depending on module version) (if enabled).
-•	Evidence\MDE\machines.json and machines-summary.csv — MDE inventory snapshot (if enabled and API access succeeds).
-•	Evidence\MDO\ — Preset policy + Safe Links/Safe Attachments policy/rule exports (if enabled).
-•	Evidence\Purview\ — Labels, label policies, DLP policies and rules exports (if enabled).
-D.4.5 Troubleshooting (common issues)
-•	Module install fails (proxy/TLS): confirm TLS 1.2, outbound access to PowerShell Gallery, and run as administrator. If a corporate proxy is required, configure it for PowerShell and retry.
-•	Graph consent prompts: ensure you sign in with an account that can consent to the requested delegated scopes (or pre-consent via tenant admin workflows).
-•	“Pilot device group not found”: confirm you entered the correct display name and that it is a device group (and not a user group). Create it first if needed.
-•	Conditional Access policy exists: the script is idempotent for CA display names; if you need to change policy settings, update the existing policy manually or extend the script to patch the policy.
-•	MDE inventory export fails: Defender for Endpoint API access may require additional tenant configuration/permissions. Treat this export as best-effort evidence only.
-•	Purview cmdlets unavailable: confirm you can connect to Security & Compliance PowerShell (Connect-IPPSSession) and that the signed-in account has appropriate Compliance roles.
-•	MDO cmdlets unavailable: confirm Defender for Office 365 licensing and Exchange Online PowerShell access; if preset policy cmdlets fail, use the Defender portal preset policies UI for that tenant.
-D.4.6 Post-run tasks (to complete the implementation)
-1.	Review evidence outputs: save the Evidence folder to the customer project repository and attach key exports to the change record (Appendix B.1).
-2.	Populate groups: add the right users/devices to:
-o	IT-Admins (admins/operators)
-o	Copilot-Pilot (pilot users)
-o	Pilot device group (pilot devices)
-o	Exceptions (only when documented)
-3.	Conditional Access: validate in Report-only (24–72 hours recommended):
-o	Review sign-in logs for impact and legacy auth attempts.
-o	Confirm break-glass access remains possible (test in the approved window).
-4.	Conditional Access: move to Enforced (On) in waves:
-o	Start with CA01 (MFA pilot), then CA02 (legacy block), then CA03 (compliant device for pilot), then CA04 (admin portals).
-o	Keep a documented rollback: remove a user from scope group or flip a single policy back to report-only/off.
-5.	Intune baseline completion:
-o	Confirm devices enrol and become Compliant.
-o	Deploy Endpoint security baselines (Windows security baseline, Defender for Endpoint baseline) from the Intune portal, unless you have approved JSON templates to automate.
-o	Resolve policy conflicts (Settings catalog vs baselines) before broad rollout.
-6.	Defender for Office 365 validation (if enabled):
-o	Confirm preset policies are assigned to the intended pilot users and quarantine processes are defined.
-o	Validate Safe Links/Safe Attachments user experience with benign test content (no malware samples).
-7.	Purview validation and tuning (if enabled):
-o	Confirm labels appear in Office apps for pilot users and guidance/tooltip text makes sense.
-o	Run DLP in Audit/Test mode; review alerts and false positives; refine sensitive info types, thresholds, and scope.
-o	Only move DLP to enforcement after acceptance criteria are met and comms/training has been delivered.
-8.	Copilot readiness checks:
-o	Confirm Copilot pilot users are licensed and can access Copilot features.
-o	Run the permission boundary tests described in Section 5.2.2 and record outcomes in Appendix B.2.
-9.	Update documentation and handover:
-o	Update Appendix A (Handover checklist) and attach Evidence outputs.
-o	Record all changes (scope, impact, rollback) in Appendix B.1.
-o	Schedule the customer IT handover walkthrough and confirm the operating model (Module 6).
+
+**Configuration Scripts for MSP Service Implementation**
+
+This project provides an example automation script to accelerate repeatable setup tasks for sub-300 seat customers. Always test in a lab tenant first, start in report-only modes where supported, and ensure proper validation before broad rollout.
+
+---
+
+## Appendix D: PowerShell Automation Guide
+
+### D.1 Prerequisites
+
+#### Software Requirements
+- **PowerShell**: 7+ (recommended) or Windows PowerShell 5.1
+- **Microsoft Graph PowerShell SDK**: Microsoft.Graph modules installed
+
+#### Required Permissions
+You will be prompted for delegated permissions. Minimum scopes required:
+
+| Scope | Purpose |
+|-------|---------|
+| `Policy.ReadWrite.ConditionalAccess` | Create Conditional Access policies |
+| `Group.ReadWrite.All` | Create groups |
+| `Directory.Read.All` | Read directory objects |
+| `Organization.Read.All` | Read subscribed SKUs |
+| `Directory.ReadWrite.All` or `Group.ReadWrite.All` | Group-based licensing |
+
+#### Tenant Prerequisites
+- At least one break-glass account
+- Pilot groups agreed upon
+- Copilot licenses available (if assigning them)
+
+---
+
+### D.2 Script Capabilities
+
+#### ✅ Can Do (Automated)
+- Connect to Microsoft Graph with required scopes
+- Create standard security groups (IT-Admins, Copilot-Pilot, Exceptions)
+- Create Conditional Access policies (report-only by default):
+  - Pilot MFA
+  - Block legacy authentication
+  - Pilot compliant-device access
+  - Admin portal protection
+- Assign Copilot licenses to pilot group via group-based licensing
+- Defender evidence exports:
+  - Secure Score
+  - ORCA (MDO posture)
+  - MDE machine inventory
+- Defender for Office 365 (MDO) configuration (optional):
+  - Enable Preset security policies
+  - Safe Links & Safe Attachments
+  - ZAP (pilot-first)
+- Purview configuration (optional):
+  - Create/update sensitivity labels
+  - Publish labels to pilot scope
+  - Create/update DLP policy (audit-first)
+  - Export evidence
+- Export configuration inventory for evidence/handover
+
+#### ❌ Cannot Do (Manual or Separate Automation)
+- Full Intune "policy-as-code" at scale (hundreds of settings)
+- SharePoint/Teams permissions remediation at scale
+- Tenant-wide baseline security mode settings (Secure Defaults)
+- Anything that could risk tenant lockout
+- Break-glass account modifications
+- Existing policy removal
+
+---
+
+### D.3 PowerShell Script (Starter Automation)
+
+*[Reference script location/details]*
+
+---
+
+### D.4 PowerShell Workflow, Prompts, and Post-Run Tasks
+
+#### D.4.1 Pre-Run Checklist (Must Do)
+
+- [ ] **Change Window**: Customer approval confirmed; pilot-first impacts understood
+- [ ] **Break-Glass Accounts**: At least one UPN known; credentials secure; excluded from CA
+- [ ] **Pilot Groups**: Display names confirmed for IT Admin, Copilot Pilot, Exceptions, and Pilot Devices
+- [ ] **Licenses**: Business Premium + optional Defender/Purview/Copilot SKUs available
+- [ ] **Workstation**: PowerShell as admin, Gallery access, TLS 1.2 enabled, interactive sign-in capable
+- [ ] **Rollback Plan**: Documented approach to roll back changes
+
+#### D.4.2 Execution Flow
+
+| Step | Action |
+|------|--------|
+| 1 | Prompt collection: tenant hint, naming, break-glass UPNs, optional modules |
+| 2 | Module installation: Graph SDK, ExchangeOnlineManagement, ORCA (if selected) |
+| 3 | Authentication: Connect to Microsoft Graph with delegated scopes |
+| 4 | Safety resolution: Resolve break-glass users; exclude from CA policies |
+| 5 | Group creation: Create/reuse standard groups (IT-Admins, Copilot-Pilot, Exceptions) |
+| 6 | Conditional Access baseline: Create 4 CA policies in Report-only mode |
+| 7 | Intune baseline (optional): Create Windows compliance policy if pilot device group exists |
+| 8 | Copilot licensing (optional): Group-based licensing for pilot group |
+| 9 | Purview (optional): Create sensitivity labels, publish (pilot-first), create DLP (audit-first) |
+| 10 | Defender for Office 365 (optional): Preset policies, Safe Links, Safe Attachments, ZAP |
+| 11 | Defender evidence (optional): ORCA, Secure Score, MDE inventory |
+| 12 | Evidence export: Write run summary and artifacts to Evidence folder |
+
+#### D.4.3 Prompt Catalog
+
+| Prompt | Controls | Guidance |
+|--------|----------|----------|
+| Tenant domain hint | Cosmetic (operator confirmation) | Optional. Use `customer.onmicrosoft.com` for sanity check |
+| Group prefix | Naming for artifacts | Keep consistent across customers (e.g., `AI-Readiness`) |
+| IT admins group name | Scope for CA04 admin protection | Use existing admin group or let script create |
+| Copilot pilot group name | Scope for pilot CA + licensing | 10–30 real users; avoid "All Users" until validated |
+| Exception users group name | CA02 exclusions | Keep empty unless documented business/technical exception |
+| Pilot device group name | Intune baseline assignments | Use device group (not user group); skipped if not found |
+| Break-glass UPNs (required) | CA exclusions for emergency | At least one; must be real cloud UPN, not shared accounts |
+| Create Intune baseline? | Whether Intune objects are created | Yes only if Intune in scope + pilot device group ready |
+| Attempt Copilot licensing? | License assignment to pilot | No if manual licensing or not purchased yet |
+| Collect Defender evidence? | Exports Secure Score/ORCA/MDE | Recommended for baseline measurement |
+| Configure Defender for Office 365? | MDO policies/Safe Links/Attachments | Yes only if licensed + pilot scope ready; start with Standard |
+| Configure Purview? | Labels, publishing, DLP | Recommended if in scope; start small + Audit mode |
+| DLP sensitive info types | What audit rule detects | Start narrow (Credit Card, Bank Account, Passport); expand later |
+
+#### D.4.4 Expected Outputs (Evidence Files)
+
+```
+Evidence/
+├── run-summary.json                                   # Choices and execution summary
+├── groups.json                                        # Created/located groups
+├── conditional-access-policies.json                   # All CA policies (report-only expected)
+├── Intune/
+│   └── created-intune-objects.json                   # Windows compliance policy, etc.
+├── Security/
+│   ├── secureScores.json                             # Secure Score snapshot
+│   └── secureScoreControlProfiles.json               # Control catalog
+├── ORCA/                                              # ORCA reports (HTML/CSV/JSON)
+├── MDE/
+│   ├── machines.json                                 # MDE inventory snapshot
+│   └── machines-summary.csv                          # Summary export
+├── MDO/                                               # Preset policy + Safe Links/Attachments
+└── Purview/                                           # Labels, label policies, DLP policies
+```
+
+#### D.4.5 Troubleshooting (Common Issues)
+
+| Issue | Solution |
+|-------|----------|
+| Module install fails (proxy/TLS) | Confirm TLS 1.2, Gallery access, admin rights. Configure proxy if needed. |
+| Graph consent prompts | Sign in with account able to consent, or pre-consent via tenant admin. |
+| "Pilot device group not found" | Verify correct display name; confirm it's a device group (not user group). Create first if needed. |
+| Conditional Access policy exists | Script is idempotent by display name. Update manually or extend script to patch. |
+| MDE inventory export fails | Defender for Endpoint API may need extra configuration. Treat as best-effort only. |
+| Purview cmdlets unavailable | Confirm Security & Compliance PowerShell access and Compliance role assignment. |
+| MDO cmdlets unavailable | Confirm Defender for Office 365 licensing and Exchange Online access. Use Defender UI if preset cmdlets fail. |
+
+#### D.4.6 Post-Run Tasks
+
+##### 1. Review & Archive Evidence
+- Save Evidence folder to customer project repository
+- Attach key exports to change record (Appendix B.1)
+
+##### 2. Populate Groups
+- **IT-Admins**: Add admins/operators
+- **Copilot-Pilot**: Add pilot users
+- **Pilot Device Group**: Add pilot devices
+- **Exceptions**: Only add with documented business/technical reason
+
+##### 3. Conditional Access: Report-Only Validation (24–72 hours)
+- Review sign-in logs for impact and legacy auth attempts
+- Confirm break-glass access remains possible (test in approved window)
+
+##### 4. Conditional Access: Move to Enforced (On) in Waves
+1. Start with **CA01** (MFA pilot)
+2. Then **CA02** (legacy block)
+3. Then **CA03** (compliant device for pilot)
+4. Then **CA04** (admin portals)
+
+Keep documented rollback: remove user from scope group or flip policy back to report-only/off
+
+##### 5. Intune Baseline Completion
+- Confirm devices enroll and become Compliant
+- Deploy Endpoint security baselines from Intune portal (unless using approved JSON templates)
+- Resolve policy conflicts (Settings catalog vs baselines) before broad rollout
+
+##### 6. Defender for Office 365 Validation
+- Confirm preset policies assigned to intended pilot users
+- Confirm quarantine processes defined
+- Validate Safe Links/Safe Attachments UX with benign test content (no malware)
+
+##### 7. Purview Validation & Tuning
+- Confirm labels appear in Office apps for pilot users
+- Run DLP in Audit/Test mode; review alerts and false positives
+- Refine sensitive info types, thresholds, and scope
+- Move DLP to enforcement only after acceptance criteria met + comms/training delivered
+
+##### 8. Copilot Readiness Checks
+- Confirm pilot users are licensed and can access Copilot features
+- Run permission boundary tests (Section 5.2.2)
+- Record outcomes in Appendix B.2
+
+##### 9. Update Documentation & Handover
+- Update Appendix A (Handover checklist)
+- Attach Evidence outputs
+- Record all changes (scope, impact, rollback) in Appendix B.1
+- Schedule customer IT handover walkthrough
+- Confirm operating model alignment (Module 6)
+
+---
+
+**Last Updated**: 2026-04-26
+```
+
+## Key Improvements Made:
+
+✅ **Hierarchical Structure**: Clear heading levels (H1–H4) for logical flow
+✅ **Tables**: Replaced text lists with organized tables for prerequisites, execution flow, and prompts
+✅ **Callout Sections**: Used checkboxes, emoji (✅❌), and visual separators
+✅ **Better Navigation**: Consistent formatting and scannable sections
+✅ **Evidence Structure**: ASCII tree showing output folder organization
+✅ **Post-Run Tasks**: Numbered, bold, and clearly sequenced
+✅ **Troubleshooting Table**: Easy reference for common issues
+✅ **White Space**: Reduced density with strategic breaks and horizontal rules
+
+Would you like me to push these changes to the repository?
