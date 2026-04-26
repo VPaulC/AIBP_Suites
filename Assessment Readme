@@ -1,0 +1,62 @@
+To run the updated Copilot readiness export script (v0.2), do this from a secure admin workstation.
+1) Save the script + create the SKU map file
+1.	Copy the script out of Appendix A and save it as, for example:
+CopilotReadinessExport.ps1
+2.	In the same folder, create sku-map.json (unless you plan to pass -SkuMapPath to another location).
+Example sku-map.json shape (you’ll fill in the exact part numbers you care about):
+{
+  "EligibleBaseSkuPartNumbers": [
+    "SPB", 
+    "SPE_E3",
+    "SPE_E5"
+  ],
+  "CopilotSkuPartNumbers": [
+    "MICROSOFT_365_COPILOT"
+  ]
+}
+2) Open PowerShell and install required modules (first run only)
+Run PowerShell 7 (recommended), then:
+Install-Module Microsoft.Graph -Scope CurrentUser
+Install-Module ExchangeOnlineManagement -Scope CurrentUser
+Install-Module Microsoft.Online.SharePoint.PowerShell -Scope CurrentUser
+Install-Module PnP.PowerShell -Scope CurrentUser
+3) Choose your “run mode” (baseline vs full)
+A) Baseline run (Graph + CA + roles + groups + SPO tenant settings + EXO mailboxes)
+.\CopilotReadinessExport.ps1 -OutputPath ".\Out"
+B) Full run (adds sharing links + MFA methods + Purview exports)
+.\CopilotReadinessExport.ps1 `
+  -OutputPath ".\Out" `
+  -IncludeSharingLinks -TopSites 25 `
+  -IncludeMfaMethods `
+  -IncludePurview
+4) What prompts to expect
+•	Graph sign-in: you’ll be prompted to consent to the requested scopes (and sign in).
+•	SharePoint (PnP): Connect-PnPOnline -Interactive will prompt you (often once per site in the current implementation).
+•	SharePoint admin shell: Connect-SPOService prompts for SPO admin sign-in.
+•	Exchange Online: Connect-ExchangeOnline prompts for sign-in.
+•	Purview: Connect-IPPSSession prompts for sign-in.
+If any area fails due to permissions/module availability, the script will still produce partial outputs and write details to:
+•	Run_Errors.csv
+5) Where the outputs go (for Power BI)
+In your -OutputPath folder you should see (at minimum):
+•	TenantSnapshot.csv
+•	Users_Licensing.csv
+•	Entra_ConditionalAccess.csv
+•	Entra_Roles.csv
+•	Teams_Groups.csv
+•	SharePoint_TenantSharing.csv
+•	Exchange_Mailboxes.csv
+•	Summary_Scores.csv
+•	Run_Errors.csv (only if something fails)
+If you enabled the switches:
+•	SharePoint_SharingLinks_TopSites.csv (when -IncludeSharingLinks)
+•	Entra_MFA_Methods.csv (when -IncludeMfaMethods)
+•	Purview_Labels.csv, Purview_LabelPolicies.csv, Purview_DlpPolicies.csv (when -IncludePurview)
+6) Optional: run for pilot users only (faster)
+.\CopilotReadinessExport.ps1 -OutputPath ".\Out" -PilotUsersUpn @("user1@domain.com","user2@domain.com") -IncludeMfaMethods
+Key takeaways
+•	Save the script as a .ps1 + create sku-map.json in the same folder.
+•	Start with the baseline run, then add -IncludeSharingLinks, -IncludeMfaMethods, -IncludePurview as permissions allow.
+Use Run_Errors.csv to quickly see what didn’t export (and why).Source reference: Internal repo path (if applicable)
+Purpose: Collect tenant configuration signals relevant to Microsoft 365 Copilot readiness and export CSV files for Power BI ingestion. The script is read-only and uses Microsoft Graph plus service-specific modules where available.
+Prerequisites: PowerShell 7 recommended; modules: Microsoft.Graph, MicrosoftTeams, ExchangeOnlineManagement, Microsoft.Online.SharePoint.PowerShell (or PnP.PowerShell if preferred). Required least-privilege roles vary by customer; aim for Global Reader plus SharePoint/Teams read scopes. If some modules/permissions are not available, the script will still export partial results and record gaps.
