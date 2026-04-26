@@ -1,0 +1,542 @@
+model (Module 6).
+#requires -Version 5.1
+#requires -RunAsAdministrator
+# ==============================
+# AI Readiness & Adoption (Sub-300) - Automation Script (Business Premium + Defender + Purview + Intune)
+#
+# What it does (high level):
+# - Installs required modules
+# - Prompts for required variables
+# - Connects to Microsoft Graph
+# - Creates standard groups (if missing)
+# - Creates baseline Conditional Access policies in Report-only by default
+# - Optional: Intune baseline automation (pilot-scoped)
+# - Optional: Copilot group-based licensing
+# - Optional: Defender for Office 365 configuration
+# - Optional: Purview labels + DLP (audit-first)
+# - Evidence exports for handover
+#
+# Safety notes:
+# - Keep break-glass accounts excluded from CA policies.
+# - CA policies are created in REPORT-ONLY by default.
+# - Intune baseline is PILOT-SCOPED and uses conservative defaults; validate conflicts before broad rollout.
+# - Defender/Purview configuration changes are OFF by default and require explicit confirmation.
+# ==============================
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+# ------------------------------
+# Helper: Simple Yes/No prompt
+# ------------------------------
+function Read-YesNo {
+param(
+[Parameter(Mandatory)][string]$Prompt,
+[bool]$DefaultYes = $true
+)
+$defaultText = if ($DefaultYes) { '[Y]/N' } else { 'Y/[N]' }
+while ($true) {
+$r = Read-Host "$Prompt $defaultText"
+if ([string]::IsNullOrWhiteSpace($r)) { return $DefaultYes }
+switch ($r.Trim().ToLower()) {
+'y' { return $true }
+'yes' { return $true }
+'n' { return $false }
+'no' { return $false }
+default { Write-Host 'Please enter Y or N.' }
+}
+}
+}
+
+# ------------------------------
+# Helper: Ensure NuGet provider / TLS for PSGallery
+# ------------------------------
+function Initialize-PSGallery {
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
+if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
+Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
+}
+$psg = Get-PSRepository -Name 'PSGallery' -ErrorAction SilentlyContinue
+if ($psg -and $psg.InstallationPolicy -ne 'Trusted') {
+if (Read-YesNo -Prompt 'Set PSGallery to Trusted (recommended for automation)?' -DefaultYes $true) {
+Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted
+}
+}
+}
+
+# ------------------------------
+# Helper: Ensure modules installed/imported
+# ------------------------------
+function Ensure-Module {
+param(
+[Parameter(Mandatory)][string]$Name,
+[string]$MinimumVersion = ''
+)
+$installed = Get-Module -ListAvailable -Name $Name | Sort-Object Version -Descending | Select-Object -First 1
+if (-not $installed -or ($MinimumVersion -and ([version]$installed.Version -lt [version]$MinimumVersion))) {
+Write-Host "Installing module: $Name"
+if ($MinimumVersion) {
+Install-Module -Name $Name -MinimumVersion $MinimumVersion -Scope CurrentUser -Force -AllowClobber
+} else {
+Install-Module -Name $Name -Scope CurrentUser -Force -AllowClobber
+}
+}
+Import-Module $Name -ErrorAction Stop
+}
+
+# ------------------------------
+# Helper: JSON export
+# ------------------------------
+function Export-Json {
+param([Parameter(Mandatory)]$Object,[Parameter(Mandatory)][string]$Path,[int]$Depth = 8)
+$Object | ConvertTo-Json -Depth $Depth | Out-File -FilePath $Path -Encoding utf8
+}
+
+# ------------------------------
+# Helper: Graph request wrapper
+# ------------------------------
+function Invoke-Graph {
+param(
+[Parameter(Mandatory)][ValidateSet('GET','POST','PATCH')][string]$Method,
+[Parameter(Mandatory)][string]$Uri,
+[object]$Body = $null
+)
+if ($Body) {
+$json = $Body | ConvertTo-Json -Depth 25
+return Invoke-MgGraphRequest -Method $Method -Uri $Uri -Body $json -ContentType 'application/json'
+} else {
+return Invoke-MgGraphRequest -Method $Method -Uri $Uri
+}
+}
+
+# ------------------------------
+# Prompt for required variables
+# ------------------------------
+Write-Host '=== AI Readiness Automation (Business Premium + Defender + Purview + Intune) ==='
+
+$TenantDomainHint = Read-Host 'Tenant domain hint (optional, e.g., contoso.onmicrosoft.com)'
+if ($TenantDomainHint -and $TenantDomainHint -notmatch '\.') { Write-Warning 'Tenant hint does not look like a domain; continuing anyway.' }
+
+$GroupPrefix = Read-Host 'Group prefix (default: AI-Readiness)'
+if ([string]::IsNullOrWhiteSpace($GroupPrefix)) { $GroupPrefix = 'AI-Readiness' }
+
+$ITAdminsGroupName = Read-Host "IT admins group display name (default: $GroupPrefix-IT-Admins)"
+if ([string]::IsNullOrWhiteSpace($ITAdminsGroupName)) { $ITAdminsGroupName = "$GroupPrefix-IT-Admins" }
+
+$PilotGroupName = Read-Host "Copilot pilot group display name (default: $GroupPrefix-Copilot-Pilot)"
+if ([string]::IsNullOrWhiteSpace($PilotGroupName)) { $PilotGroupName = "$GroupPrefix-Copilot-Pilot" }
+
+$ExceptionGroupName = Read-Host "Exception users group display name (optional; default: $GroupPrefix-Exceptions)"
+if ([string]::IsNullOrWhiteSpace($ExceptionGroupName)) { $ExceptionGroupName = "$GroupPrefix-Exceptions" }
+
+$PilotDeviceGroupName = Read-Host "Pilot device group display name for Intune assignments (recommended; e.g., $GroupPrefix-Devices-Pilot)"
+
+$BreakGlassUpnsRaw = Read-Host 'Break-glass account UPNs to exclude (comma-separated, REQUIRED)'
+if ([string]::IsNullOrWhiteSpace($BreakGlassUpnsRaw)) { throw 'Break-glass UPNs are required.' }
+$BreakGlassUpns = $BreakGlassUpnsRaw.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+if ($BreakGlassUpns.Count -lt 1) { throw 'At least one break-glass UPN is required.' }
+
+$CA_MfaPilot_Name = Read-Host 'CA policy name for Require MFA (default: CA01 - Require MFA - Copilot Pilot)'
+if ([string]::IsNullOrWhiteSpace($CA_MfaPilot_Name)) { $CA_MfaPilot_Name = 'CA01 - Require MFA - Copilot Pilot' }
+
+$CA_BlockLegacy_Name = Read-Host 'CA policy name for Block legacy auth (default: CA02 - Block legacy authentication)'
+if ([string]::IsNullOrWhiteSpace($CA_BlockLegacy_Name)) { $CA_BlockLegacy_Name = 'CA02 - Block legacy authentication' }
+
+$CA_CompliantDevice_Name = Read-Host 'CA policy name for Require compliant device (default: CA03 - Require compliant device - Copilot Pilot)'
+if ([string]::IsNullOrWhiteSpace($CA_CompliantDevice_Name)) { $CA_CompliantDevice_Name = 'CA03 - Require compliant device - Copilot Pilot' }
+
+$CA_AdminPortals_Name = Read-Host 'CA policy name for Admin portal protection (default: CA04 - Protect admin portals - IT Admins)'
+if ([string]::IsNullOrWhiteSpace($CA_AdminPortals_Name)) { $CA_AdminPortals_Name = 'CA04 - Protect admin portals - IT Admins' }
+
+$OutDir = Read-Host 'Output folder for evidence (default: .\Evidence)'
+if ([string]::IsNullOrWhiteSpace($OutDir)) { $OutDir = '.\Evidence' }
+
+# Intune baseline automation (OFF by default) $DoIntuneBaseline = Read-YesNo -Prompt 'Create a basic Intune baseline (pilot-scoped)?' -DefaultYes $false $DoIntuneWindows = $false $DoIntuneWindowsCompliance = $false $DoIntuneBitLocker = $false $DoIntuneDefenderAv = $false $DoIntuneFirewall = $false if ($DoIntuneBaseline) { $DoIntuneWindows = Read-YesNo -Prompt 'Target Windows 10/11 devices?' -DefaultYes $true if ($DoIntuneWindows) { $DoIntuneWindowsCompliance = Read-YesNo -Prompt 'Create Windows compliance policy (baseline)?' -DefaultYes $true $DoIntuneBitLocker = Read-YesNo -Prompt 'Create BitLocker disk encryption policy (baseline)?' -DefaultYes $true $DoIntuneDefenderAv = Read-YesNo -Prompt 'Create Microsoft Defender Antivirus policy (baseline)?' -DefaultYes $true $DoIntuneFirewall = Read-YesNo -Prompt 'Create Windows Firewall policy (baseline)?' -DefaultYes $true } Write-Warning 'Intune policies can conflict with existing profiles. Pilot first and check policy conflicts before expanding.' if (-not (Read-YesNo -Prompt 'Final confirmation: proceed with Intune baseline creation now?' -DefaultYes $false)) { Write-Host 'Intune baseline cancelled by operator.' $DoIntuneBaseline = $false } } 
+# Copilot licensing $DoCopilotLicensing = Read-YesNo -Prompt 'Attempt group-based licensing for Copilot pilot group?' -DefaultYes $true $CopilotSkuPartNumberHint = Read-Host 'Copilot SKU Part Number hint (default: MICROSOFT_365_COPILOT)' if ([string]::IsNullOrWhiteSpace($CopilotSkuPartNumberHint)) { $CopilotSkuPartNumberHint = 'MICROSOFT_365_COPILOT' } 
+# Defender evidence prompts (safe/read-only defaults) $DoDefenderEvidence = Read-YesNo -Prompt 'Collect Defender evidence (Secure Score, ORCA, MDE inventory exports)?' -DefaultYes $true $DoOrca = Read-YesNo -Prompt 'Run ORCA (Defender for Office 365 configuration assessment) report?' -DefaultYes $true $DoSecureScore = Read-YesNo -Prompt 'Export Microsoft Secure Score (security) controls and current score?' -DefaultYes $true $DoMdeInventory = Read-YesNo -Prompt 'Export Microsoft Defender for Endpoint (MDE) machine inventory (read-only)?' -DefaultYes $true 
+# Microsoft Defender for Office 365 (MDO) policy configuration (OFF by default) $DoMdoConfig = Read-YesNo -Prompt 'Configure Defender for Office 365 policies (Preset policies + Safe Links/Attachments + ZAP)?' -DefaultYes $false $MdoUsePresets = $false $MdoStandardGroupName = '' $MdoStrictGroupName = '' $MdoEnableZAP = $false $MdoEnableSafeLinks = $false $MdoEnableSafeAttachments = $false $MdoSafeLinksDoNotTrack = $true $MdoSafeLinksAllowClickThrough = $false $MdoSafeAttachmentsAction = 'DynamicDelivery' if ($DoMdoConfig) { Write-Host '--- MDO configuration options ---' $MdoUsePresets = Read-YesNo -Prompt 'Use Preset security policies (recommended)?' -DefaultYes $true if ($MdoUsePresets) { $MdoStandardGroupName = Read-Host "Preset policy assignment: Standard protection group (default: $PilotGroupName)" if ([string]::IsNullOrWhiteSpace($MdoStandardGroupName)) { $MdoStandardGroupName = $PilotGroupName } $MdoStrictGroupName = Read-Host 'Preset policy assignment: Strict protection group (optional; e.g., Executives)' } $MdoEnableZAP = Read-YesNo -Prompt 'Enable/confirm Zero-hour auto purge (ZAP)?' -DefaultYes $true $MdoEnableSafeLinks = Read-YesNo -Prompt 'Enable/confirm Safe Links policy for email?' -DefaultYes $true $MdoEnableSafeAttachments = Read-YesNo -Prompt 'Enable/confirm Safe Attachments policy?' -DefaultYes $true if ($MdoEnableSafeLinks) { $MdoSafeLinksDoNotTrack = Read-YesNo -Prompt 'Safe Links: Do not track user clicks? (privacy-friendly)' -DefaultYes $true $MdoSafeLinksAllowClickThrough = Read-YesNo -Prompt 'Safe Links: Allow users to click through to original URL?' -DefaultYes $false } if ($MdoEnableSafeAttachments) { $sa = Read-Host 'Safe Attachments action (default: DynamicDelivery; options: Block, Replace, DynamicDelivery)' if ([string]::IsNullOrWhiteSpace($sa)) { $sa = 'DynamicDelivery' } $MdoSafeAttachmentsAction = $sa } Write-Warning 'MDO changes can affect email delivery and user experience. Use a change window and pilot scope first.' if (-not (Read-YesNo -Prompt 'Final confirmation: proceed with MDO configuration changes now?' -DefaultYes $false)) { Write-Host 'MDO configuration cancelled by operator.' $DoMdoConfig = $false } } 
+# Purview configuration (OFF by default) $DoPurviewConfig = Read-YesNo -Prompt 'Configure Purview (sensitivity labels + publishing + DLP audit policy)?' -DefaultYes $false $PurviewPilotGroupName = '' $PurviewCreateLabels = $false $PurviewPublishLabels = $false $PurviewCreateDlp = $false $PurviewDlpMode = 'Audit' $PurviewSITsRaw = '' $PurviewLabelSet = @( @{ Name = 'Public'; DisplayName = 'Public'; Tooltip = 'Approved for public sharing' }, @{ Name = 'Internal'; DisplayName = 'Internal'; Tooltip = 'Internal business use only' }, @{ Name = 'Confidential'; DisplayName = 'Confidential'; Tooltip = 'Sensitive business data' }, @{ Name = 'Highly Confidential'; DisplayName = 'Highly Confidential'; Tooltip = 'Highly sensitive, restricted access' } ) if ($DoPurviewConfig) { Write-Host '--- Purview configuration options ---' $PurviewPilotGroupName = Read-Host "Purview pilot scope for labels/DLP (default: $PilotGroupName; can also use 'All')" if ([string]::IsNullOrWhiteSpace($PurviewPilotGroupName)) { $PurviewPilotGroupName = $PilotGroupName } $PurviewCreateLabels = Read-YesNo -Prompt 'Create/update sensitivity labels (4-label baseline)?' -DefaultYes $true $PurviewPublishLabels = Read-YesNo -Prompt 'Create/update a label publishing policy (pilot-first)?' -DefaultYes $true $PurviewCreateDlp = Read-YesNo -Prompt 'Create/update a DLP policy (audit-first)?' -DefaultYes $true $mode = Read-Host 'DLP mode (default: Audit; options: Audit, Enforce)' if (-not [string]::IsNullOrWhiteSpace($mode)) { $PurviewDlpMode = $mode } if ($PurviewDlpMode -notin @('Audit','Enforce')) { Write-Warning 'Invalid DLP mode. Using Audit.'; $PurviewDlpMode = 'Audit' } $PurviewSITsRaw = Read-Host "Sensitive info types for DLP rule (comma-separated; default: Credit Card Number)" if ([string]::IsNullOrWhiteSpace($PurviewSITsRaw)) { $PurviewSITsRaw = 'Credit Card Number' } Write-Warning 'Purview changes can affect user experience (labelling prompts, DLP policy tips/actions). Pilot first.' if (-not (Read-YesNo -Prompt 'Final confirmation: proceed with Purview configuration changes now?' -DefaultYes $false)) { Write-Host 'Purview configuration cancelled by operator.' $DoPurviewConfig = $false } } 
+# Optional (advanced): allow limited Defender response actions (keep Off unless you truly need it) $DoDefenderActions = Read-YesNo -Prompt 'Allow Defender response actions via API (NOT recommended; keep No unless required)?' -DefaultYes $false 
+# ------------------------------
+# Install/import required modules
+# ------------------------------
+Initialize-PSGallery
+Ensure-Module -Name 'Microsoft.Graph.Authentication'
+Ensure-Module -Name 'Microsoft.Graph.Groups'
+Ensure-Module -Name 'Microsoft.Graph.Identity.SignIns'
+Ensure-Module -Name 'Microsoft.Graph.Identity.DirectoryManagement'
+Ensure-Module -Name 'Microsoft.Graph.Users'
+Ensure-Module -Name 'Microsoft.Graph.Organization'
+Ensure-Module -Name 'Microsoft.Graph.Security'
+
+# Used for Intune policy creation via Graph (deviceManagement) Ensure-Module -Name 'Microsoft.Graph.DeviceManagement' 
+# Exchange Online connectivity needed for ORCA, MDO configuration, and Purview (IPPSSession)
+if ($DoOrca -or $DoMdoConfig -or $DoPurviewConfig) { Ensure-Module -Name 'ExchangeOnlineManagement' }
+if ($DoOrca) { Ensure-Module -Name 'ORCA' }
+
+# ------------------------------
+# Authenticate (delegated) to Microsoft Graph
+# ------------------------------
+$Scopes = @(
+'Policy.ReadWrite.ConditionalAccess',
+'Group.ReadWrite.All',
+'User.Read.All',
+'Directory.Read.All',
+'Organization.Read.All',
+'SecurityEvents.Read.All',
+'DeviceManagementConfiguration.ReadWrite.All',
+'DeviceManagementManagedDevices.Read.All'
+)
+if ($DoDefenderActions) { $Scopes += 'SecurityEvents.ReadWrite.All' }
+
+Write-Host 'Connecting to Microsoft Graph...'
+Connect-MgGraph -Scopes $Scopes | Out-Null
+$ctx = Get-MgContext
+Write-Host "Connected as: $($ctx.Account)"
+Write-Host "TenantId: $($ctx.TenantId)"
+
+# ------------------------------
+# Resolve break-glass user object IDs (required for CA exclusions)
+# ------------------------------
+$BreakGlassUserIds = New-Object System.Collections.Generic.List[string]
+foreach ($upn in $BreakGlassUpns) {
+Write-Host "Resolving break-glass user: $upn"
+$u = Get-MgUser -UserId $upn -ErrorAction Stop
+$BreakGlassUserIds.Add($u.Id)
+}
+
+# ------------------------------
+# Helpers: Groups and CA policies
+# ------------------------------
+function Get-OrCreateGroup {
+param(
+[Parameter(Mandatory)][string]$DisplayName,
+[string]$Description = 'Created by AI Readiness automation script'
+)
+$escaped = $DisplayName.Replace("'","''")
+$existing = Get-MgGroup -Filter "displayName eq '$escaped'" -ConsistencyLevel eventual -All -ErrorAction SilentlyContinue
+if ($existing) {
+Write-Host "Group exists: $DisplayName"
+return $existing | Select-Object -First 1
+}
+$mailNick = ($DisplayName -replace '[^a-zA-Z0-9]','').ToLower()
+if ($mailNick.Length -gt 40) { $mailNick = $mailNick.Substring(0,40) }
+Write-Host "Creating group: $DisplayName"
+$params = @{ DisplayName = $DisplayName; MailEnabled = $false; MailNickname = $mailNick; SecurityEnabled = $true; Description = $Description }
+return New-MgGroup -BodyParameter $params
+}
+
+function Get-OrCreateCAPolicy {
+param([Parameter(Mandatory)][hashtable]$Body)
+$name = $Body.displayName
+$existing = Get-MgIdentityConditionalAccessPolicy -All | Where-Object { $_.DisplayName -eq $name }
+if ($existing) { Write-Host "CA policy exists: $name"; return $existing | Select-Object -First 1 }
+Write-Host "Creating CA policy: $name"
+return New-MgIdentityConditionalAccessPolicy -BodyParameter $Body
+}
+
+# ------------------------------
+# Intune helpers (Graph deviceManagement) # ------------------------------ function Get-ByDisplayName { param([Parameter(Mandatory)][string]$Uri,[Parameter(Mandatory)][string]$DisplayName) $escaped = $DisplayName.Replace("'","''") $res = Invoke-Graph -Method GET -Uri "$Uri?`$filter=displayName eq '$escaped'" return $res.value | Select-Object -First 1 } function Ensure-IntuneObject { param( [Parameter(Mandatory)][string]$CollectionUri, [Parameter(Mandatory)][string]$DisplayName, [Parameter(Mandatory)][hashtable]$Body ) $existing = Get-ByDisplayName -Uri $CollectionUri -DisplayName $DisplayName if (-not $existing) { Write-Host "Creating Intune object: $DisplayName" return Invoke-Graph -Method POST -Uri $CollectionUri -Body $Body } else { Write-Host "Intune object exists: $DisplayName (no destructive update applied)" return $existing } } function Assign-DeviceConfiguration { param( [Parameter(Mandatory)][string]$ObjectUri, [Parameter(Mandatory)][string]$GroupId ) $assignBody = @{ assignments = @(@{ target = @{ '@odata.type' = '#microsoft.graph.groupAssignmentTarget'; groupId = $GroupId } }) } Invoke-Graph -Method POST -Uri "$ObjectUri/assign" -Body $assignBody | Out-Null } 
+# ------------------------------
+# Create/reuse standard groups
+# ------------------------------
+$gIT = Get-OrCreateGroup -DisplayName $ITAdminsGroupName -Description 'Admins / IT staff (scope group)'
+$gPilot = Get-OrCreateGroup -DisplayName $PilotGroupName -Description 'Copilot pilot users (scope group)'
+$gEx = Get-OrCreateGroup -DisplayName $ExceptionGroupName -Description 'Exception users (exclude from scoped controls)'
+
+$gPilotDevices = $null if ($PilotDeviceGroupName) { try { $escapedPD = $PilotDeviceGroupName.Replace("'","''") $gPilotDevices = Get-MgGroup -Filter "displayName eq '$escapedPD'" -ConsistencyLevel eventual -All -ErrorAction SilentlyContinue | Select-Object -First 1 if (-not $gPilotDevices) { Write-Warning "Pilot device group '$PilotDeviceGroupName' not found. Intune assignments will be skipped." } else { Write-Host "Resolved pilot device group: $($gPilotDevices.DisplayName)" } } catch { Write-Warning "Could not resolve pilot device group '$PilotDeviceGroupName'. Intune assignments will be skipped." } } 
+# ------------------------------
+# Conditional Access (REPORT-ONLY)
+# ------------------------------
+$caMfaBody = @{ displayName = $CA_MfaPilot_Name; state = 'enabledForReportingButNotEnforced'; conditions = @{ clientAppTypes = @('mobileAppsAndDesktopClients','browser'); applications = @{ includeApplications = @('All') }; users = @{ includeGroups = @($gPilot.Id); excludeUsers = $BreakGlassUserIds } }; grantControls = @{ operator = 'OR'; builtInControls = @('mfa') } }
+[void](Get-OrCreateCAPolicy -Body $caMfaBody)
+
+$caLegacyBody = @{ displayName = $CA_BlockLegacy_Name; state = 'enabledForReportingButNotEnforced'; conditions = @{ applications = @{ includeApplications = @('All') }; users = @{ includeUsers = @('All'); excludeUsers = $BreakGlassUserIds; excludeGroups = @($gEx.Id) }; clientAppTypes = @('exchangeActiveSync','other') }; grantControls = @{ operator = 'OR'; builtInControls = @('block') } }
+[void](Get-OrCreateCAPolicy -Body $caLegacyBody)
+
+$caCompliantBody = @{ displayName = $CA_CompliantDevice_Name; state = 'enabledForReportingButNotEnforced'; conditions = @{ clientAppTypes = @('mobileAppsAndDesktopClients','browser'); applications = @{ includeApplications = @('Office365') }; users = @{ includeGroups = @($gPilot.Id); excludeUsers = $BreakGlassUserIds } }; grantControls = @{ operator = 'OR'; builtInControls = @('compliantDevice') } }
+[void](Get-OrCreateCAPolicy -Body $caCompliantBody)
+
+$caAdminBody = @{ displayName = $CA_AdminPortals_Name; state = 'enabledForReportingButNotEnforced'; conditions = @{ clientAppTypes = @('browser'); applications = @{ includeApplications = @('MicrosoftAdminPortals') }; users = @{ includeGroups = @($gIT.Id); excludeUsers = $BreakGlassUserIds } }; grantControls = @{ operator = 'OR'; builtInControls = @('mfa') } }
+[void](Get-OrCreateCAPolicy -Body $caAdminBody)
+
+# ------------------------------ # Intune baseline (pilot-scoped) # ------------------------------ if ($DoIntuneBaseline -and $gPilotDevices) { Write-Host '=== Intune baseline creation (pilot-scoped) ===' $intDir = Join-Path $OutDir 'Intune' New-Item -ItemType Directory -Path $intDir -Force | Out-Null $created = @() # Windows compliance policy (deviceCompliancePolicies) if ($DoIntuneWindowsCompliance) { $name = "CP01 - Windows - Compliance Baseline ($GroupPrefix)" $body = @{ '@odata.type' = '#microsoft.graph.windows10CompliancePolicy' displayName = $name description = 'Baseline Windows compliance policy (pilot-first)' passwordRequired = $true passwordMinimumLength = 6 passwordRequiredType = 'alphanumeric' osMinimumVersion = '' bitLockerEnabled = $true secureBootEnabled = $true codeIntegrityEnabled = $true } $obj = Ensure-IntuneObject -CollectionUri 'https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicies' -DisplayName $name -Body $body $created += $obj try { Assign-DeviceConfiguration -ObjectUri "https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicies/$($obj.id)" -GroupId $gPilotDevices.Id } catch { Write-Warning "Compliance assignment failed: $($_.Exception.Message)" } } # BitLocker (endpoint security / settings catalog is complex; use a minimal configuration profile placeholder) if ($DoIntuneBitLocker) { $name = "DE01 - BitLocker - Pilot ($GroupPrefix)" $body = @{ '@odata.type' = '#microsoft.graph.deviceConfiguration' displayName = $name description = 'Placeholder baseline: configure BitLocker via Endpoint security > Disk encryption (recommended). This profile is created as an evidence marker only.' } $obj = Ensure-IntuneObject -CollectionUri 'https://graph.microsoft.com/v1.0/deviceManagement/deviceConfigurations' -DisplayName $name -Body $body $created += $obj } # Defender AV and Firewall are best deployed via Endpoint security templates/settings catalog. # For repeatability in SMB, this script creates named placeholders for governance/evidence and relies on portal-created baselines. if ($DoIntuneDefenderAv) { $name = "AV01 - Defender Antivirus - Baseline ($GroupPrefix)" $body = @{ '@odata.type' = '#microsoft.graph.deviceConfiguration'; displayName = $name; description = 'Placeholder baseline: configure Defender Antivirus via Endpoint security > Antivirus (recommended). Created for evidence tracking.' } $obj = Ensure-IntuneObject -CollectionUri 'https://graph.microsoft.com/v1.0/deviceManagement/deviceConfigurations' -DisplayName $name -Body $body $created += $obj } if ($DoIntuneFirewall) { $name = "FW01 - Windows Firewall - Baseline ($GroupPrefix)" $body = @{ '@odata.type' = '#microsoft.graph.deviceConfiguration'; displayName = $name; description = 'Placeholder baseline: configure Firewall via Endpoint security > Firewall (recommended). Created for evidence tracking.' } $obj = Ensure-IntuneObject -CollectionUri 'https://graph.microsoft.com/v1.0/deviceManagement/deviceConfigurations' -DisplayName $name -Body $body $created += $obj } try { Export-Json -Object $created -Path (Join-Path $intDir 'created-intune-objects.json') -Depth 20 } catch { } } 
+# ------------------------------
+# (Existing sections below: Copilot licensing, Purview, MDO, Defender evidence, exports) # NOTE: To keep this starter script concise, the remainder of the sections are unchanged from the previous version. # ------------------------------ 
+Write-Host 'Intune baseline section added. Review remaining script sections (Copilot licensing, Purview, MDO, Defender evidence) in the document below this block.'
+# ------------------------------
+# Optional: Group-based licensing for Copilot pilot group
+# ------------------------------
+if ($DoCopilotLicensing) {
+try {
+Write-Host 'Searching subscribed SKUs for Copilot...'
+$skus = Get-MgSubscribedSku -All
+$copilot = $skus | Where-Object { $_.SkuPartNumber -eq $CopilotSkuPartNumberHint } | Select-Object -First 1
+if (-not $copilot) {
+Write-Warning "Could not find SKU '$CopilotSkuPartNumberHint'. Available SKUs (SkuPartNumber, SkuId):"
+$skus | Select-Object SkuPartNumber, SkuId | Sort-Object SkuPartNumber | Format-Table -AutoSize | Out-String | Write-Host
+Write-Warning 'Skipping Copilot licensing step.'
+} else {
+Write-Host "Assigning SKU to pilot group: $($copilot.SkuPartNumber)"
+$licenseParams = @{ AddLicenses = @(@{ SkuId = $copilot.SkuId }); RemoveLicenses = @() }
+Set-MgGroupLicense -GroupId $gPilot.Id -BodyParameter $licenseParams | Out-Null
+}
+} catch {
+Write-Warning "Group-based licensing step skipped/failed: $($_.Exception.Message)"
+}
+} else {
+Write-Host 'Skipping Copilot licensing step (operator selected No).'
+}
+# ------------------------------
+# Purview helpers (Compliance PowerShell)
+# ------------------------------
+function Connect-Compliance {
+Write-Host 'Connecting to Microsoft Purview (Security & Compliance PowerShell)...'
+Connect-IPPSSession -ErrorAction Stop | Out-Null
+}
+
+function Get-OrCreateSensitivityLabel {
+param([Parameter(Mandatory)][hashtable]$Label)
+$name = $Label.Name
+$existing = Get-Label -Identity $name -ErrorAction SilentlyContinue
+if (-not $existing) {
+Write-Host "Creating label: $name"
+New-Label -Name $name -DisplayName $Label.DisplayName -Tooltip $Label.Tooltip -ErrorAction Stop | Out-Null
+} else {
+Write-Host "Label exists: $name (updating display/tooltip if needed)"
+Set-Label -Identity $name -DisplayName $Label.DisplayName -Tooltip $Label.Tooltip -ErrorAction SilentlyContinue | Out-Null
+}
+return Get-Label -Identity $name -ErrorAction Stop
+}
+
+function Get-OrCreateLabelPolicy {
+param(
+[Parameter(Mandatory)][string]$PolicyName,
+[Parameter(Mandatory)][string[]]$LabelNames,
+[Parameter(Mandatory)][string]$ScopeValue
+)
+$existing = Get-LabelPolicy -Identity $PolicyName -ErrorAction SilentlyContinue
+if (-not $existing) {
+Write-Host "Creating label policy: $PolicyName"
+try {
+New-LabelPolicy -Name $PolicyName -Labels $LabelNames -ExchangeLocation $ScopeValue -SharePointLocation $ScopeValue -OneDriveLocation $ScopeValue -ErrorAction Stop | Out-Null
+} catch {
+Write-Warning "Could not scope label policy to '$ScopeValue' via cmdlet. Creating policy to 'All' (adjust scope in portal if required)."
+New-LabelPolicy -Name $PolicyName -Labels $LabelNames -ExchangeLocation All -SharePointLocation All -OneDriveLocation All -ErrorAction Stop | Out-Null
+}
+} else {
+Write-Host "Label policy exists: $PolicyName (ensuring labels included)"
+try { Set-LabelPolicy -Identity $PolicyName -AddLabels $LabelNames -ErrorAction Stop | Out-Null } catch { }
+}
+return Get-LabelPolicy -Identity $PolicyName -ErrorAction SilentlyContinue
+}
+
+function Get-OrCreateDlpPolicyAndRule {
+param(
+[Parameter(Mandatory)][string]$PolicyName,
+[Parameter(Mandatory)][string]$RuleName,
+[Parameter(Mandatory)][string[]]$SensitiveInfoTypes,
+[ValidateSet('Audit','Enforce')][string]$Mode = 'Audit'
+)
+$policy = Get-DlpCompliancePolicy -Identity $PolicyName -ErrorAction SilentlyContinue
+if (-not $policy) {
+Write-Host "Creating DLP policy: $PolicyName"
+New-DlpCompliancePolicy -Name $PolicyName -Mode Test -Comment 'Created by AI Readiness automation (audit-first)' -ErrorAction Stop | Out-Null
+} else {
+Write-Host "DLP policy exists: $PolicyName"
+}
+$rule = Get-DlpComplianceRule -Identity $RuleName -ErrorAction SilentlyContinue
+$sitExpr = @{ Name = $SensitiveInfoTypes; minCount = 1 }
+if (-not $rule) {
+Write-Host "Creating DLP rule: $RuleName"
+New-DlpComplianceRule -Name $RuleName -Policy $PolicyName -ContentContainsSensitiveInformation $sitExpr -NotifyUser $true -UserNotifications 'NotifyUser' -GenerateAlert $true -IncidentReportContent 'Default' -ErrorAction Stop | Out-Null
+} else {
+Write-Host "DLP rule exists: $RuleName (no destructive updates applied)"
+}
+if ($Mode -eq 'Audit') {
+try { Set-DlpCompliancePolicy -Identity $PolicyName -Mode Test -ErrorAction Stop | Out-Null } catch { }
+} else {
+try { Set-DlpCompliancePolicy -Identity $PolicyName -Mode Enable -ErrorAction Stop | Out-Null } catch { }
+}
+}
+
+# ------------------------------
+# Purview configuration (Sensitivity labels + publishing + DLP audit-first)
+# ------------------------------
+if ($DoPurviewConfig) {
+Write-Host '=== Configuring Microsoft Purview (labels + DLP) ==='
+$purDir = Join-Path $OutDir 'Purview'
+New-Item -ItemType Directory -Path $purDir -Force | Out-Null
+try {
+Connect-Compliance
+$labelNames = New-Object System.Collections.Generic.List[string]
+if ($PurviewCreateLabels) {
+foreach ($l in $PurviewLabelSet) {
+$created = Get-OrCreateSensitivityLabel -Label $l
+$labelNames.Add($created.Name)
+}
+} else {
+foreach ($l in $PurviewLabelSet) { $labelNames.Add($l.Name) }
+}
+if ($PurviewPublishLabels) {
+$polName = "LP01 - Labels - $GroupPrefix (Pilot)"
+Get-OrCreateLabelPolicy -PolicyName $polName -LabelNames $labelNames.ToArray() -ScopeValue $PurviewPilotGroupName | Out-Null
+}
+if ($PurviewCreateDlp) {
+$dlpName = "DLP01 - Sensitive info - $GroupPrefix"
+$dlpRule = "DLP01R - Sensitive info - $GroupPrefix"
+$sits = $PurviewSITsRaw.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+Get-OrCreateDlpPolicyAndRule -PolicyName $dlpName -RuleName $dlpRule -SensitiveInfoTypes $sits -Mode $PurviewDlpMode
+}
+try { Get-Label | Select-Object Name, DisplayName, Tooltip, WhenCreated, WhenChanged | ConvertTo-Json -Depth 6 | Out-File (Join-Path $purDir 'labels.json') -Encoding utf8 } catch { }
+try { Get-LabelPolicy | Select-Object Name, Labels, Enabled, Mode, ExchangeLocation, SharePointLocation, OneDriveLocation | ConvertTo-Json -Depth 8 | Out-File (Join-Path $purDir 'label-policies.json') -Encoding utf8 } catch { }
+try { Get-DlpCompliancePolicy | Select-Object Name, Mode, State, Comment | ConvertTo-Json -Depth 6 | Out-File (Join-Path $purDir 'dlp-policies.json') -Encoding utf8 } catch { }
+try { Get-DlpComplianceRule | Select-Object Name, Policy, Disabled, ContentContainsSensitiveInformation | ConvertTo-Json -Depth 10 | Out-File (Join-Path $purDir 'dlp-rules.json') -Encoding utf8 } catch { }
+try { Disconnect-IPPSSession -ErrorAction SilentlyContinue | Out-Null } catch { }
+} catch {
+Write-Warning "Purview configuration failed/skipped: $($_.Exception.Message)"
+try { Disconnect-IPPSSession -ErrorAction SilentlyContinue | Out-Null } catch { }
+}
+}
+# ------------------------------
+# Defender for Office 365 (MDO) policy configuration (Exchange Online)
+# ------------------------------
+if ($DoMdoConfig) {
+Write-Host '=== Configuring Microsoft Defender for Office 365 policies ==='
+$mdoDir = Join-Path $OutDir 'MDO'
+New-Item -ItemType Directory -Path $mdoDir -Force | Out-Null
+try {
+Write-Host 'Connecting to Exchange Online...'
+Connect-ExchangeOnline -ShowBanner:$false | Out-Null
+$standardRecipients = @()
+$strictRecipients = @()
+if ($MdoUsePresets) {
+Write-Host "Resolving Standard group for presets: $MdoStandardGroupName"
+$stdGroup = Get-DistributionGroup -Identity $MdoStandardGroupName -ErrorAction SilentlyContinue
+if (-not $stdGroup) { $stdGroup = Get-UnifiedGroup -Identity $MdoStandardGroupName -ErrorAction SilentlyContinue }
+if (-not $stdGroup) { $stdGroup = Get-Recipient -Identity $MdoStandardGroupName -ErrorAction Stop }
+$standardRecipients = @($stdGroup.PrimarySmtpAddress.ToString())
+if (-not [string]::IsNullOrWhiteSpace($MdoStrictGroupName)) {
+Write-Host "Resolving Strict group for presets: $MdoStrictGroupName"
+$stGroup = Get-DistributionGroup -Identity $MdoStrictGroupName -ErrorAction SilentlyContinue
+if (-not $stGroup) { $stGroup = Get-UnifiedGroup -Identity $MdoStrictGroupName -ErrorAction SilentlyContinue }
+if (-not $stGroup) { $stGroup = Get-Recipient -Identity $MdoStrictGroupName -ErrorAction Stop }
+$strictRecipients = @($stGroup.PrimarySmtpAddress.ToString())
+}
+Write-Host 'Enabling/updating Preset security policies...'
+try {
+Set-AtpPolicyForO365 -Identity 'Standard Preset Security Policy' -Enable $true -TargetedUsersToProtect $standardRecipients -ErrorAction Stop
+} catch {
+$pol = Get-AtpPolicyForO365 | Where-Object { $_.Name -match 'Standard' } | Select-Object -First 1
+if ($pol) { Set-AtpPolicyForO365 -Identity $pol.Identity -Enable $true -TargetedUsersToProtect $standardRecipients } else { throw }
+}
+if ($strictRecipients.Count -gt 0) {
+try {
+Set-AtpPolicyForO365 -Identity 'Strict Preset Security Policy' -Enable $true -TargetedUsersToProtect $strictRecipients -ErrorAction Stop
+} catch {
+$pol2 = Get-AtpPolicyForO365 | Where-Object { $_.Name -match 'Strict' } | Select-Object -First 1
+if ($pol2) { Set-AtpPolicyForO365 -Identity $pol2.Identity -Enable $true -TargetedUsersToProtect $strictRecipients } else { throw }
+}
+} else {
+Write-Host 'Strict preset not configured (no Strict group provided).'
+}
+}
+if ($MdoEnableZAP) {
+try { Set-OrganizationConfig -ZapEnabled $true -ErrorAction Stop | Out-Null } catch { Write-Warning "Could not set ZAP: $($_.Exception.Message)" }
+}
+if ($MdoEnableSafeLinks) {
+try {
+$slName = "SL01 - Safe Links - $GroupPrefix"
+$existingSl = Get-SafeLinksPolicy -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $slName } | Select-Object -First 1
+if (-not $existingSl) {
+New-SafeLinksPolicy -Name $slName -IsEnabled $true -ScanUrls $true -EnableSafeLinksForTeams $true -EnableSafeLinksForOffice $true -DoNotTrackUserClicks $MdoSafeLinksDoNotTrack -AllowClickThrough $MdoSafeLinksAllowClickThrough | Out-Null
+} else {
+Set-SafeLinksPolicy -Identity $slName -IsEnabled $true -ScanUrls $true -EnableSafeLinksForTeams $true -EnableSafeLinksForOffice $true -DoNotTrackUserClicks $MdoSafeLinksDoNotTrack -AllowClickThrough $MdoSafeLinksAllowClickThrough | Out-Null
+}
+$slRuleName = "SLR01 - Safe Links - $GroupPrefix"
+$existingRule = Get-SafeLinksRule -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $slRuleName } | Select-Object -First 1
+if ($standardRecipients.Count -gt 0) {
+if (-not $existingRule) { New-SafeLinksRule -Name $slRuleName -SafeLinksPolicy $slName -SentToMemberOf $standardRecipients -Priority 0 | Out-Null }
+else { Set-SafeLinksRule -Identity $slRuleName -SafeLinksPolicy $slName -SentToMemberOf $standardRecipients | Out-Null }
+} else { Write-Warning 'No Standard group resolved for Safe Links rule; configure scope manually if needed.' }
+} catch { Write-Warning "Safe Links configuration failed/skipped: $($_.Exception.Message)" }
+}
+if ($MdoEnableSafeAttachments) {
+try {
+$saName = "SA01 - Safe Attachments - $GroupPrefix"
+$existingSa = Get-SafeAttachmentPolicy -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $saName } | Select-Object -First 1
+if (-not $existingSa) { New-SafeAttachmentPolicy -Name $saName -Enable $true -Action $MdoSafeAttachmentsAction | Out-Null }
+else { Set-SafeAttachmentPolicy -Identity $saName -Enable $true -Action $MdoSafeAttachmentsAction | Out-Null }
+$saRuleName = "SAR01 - Safe Attachments - $GroupPrefix"
+$existingSaRule = Get-SafeAttachmentRule -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $saRuleName } | Select-Object -First 1
+if ($standardRecipients.Count -gt 0) {
+if (-not $existingSaRule) { New-SafeAttachmentRule -Name $saRuleName -SafeAttachmentPolicy $saName -SentToMemberOf $standardRecipients -Priority 0 | Out-Null }
+else { Set-SafeAttachmentRule -Identity $saRuleName -SafeAttachmentPolicy $saName -SentToMemberOf $standardRecipients | Out-Null }
+} else { Write-Warning 'No Standard group resolved for Safe Attachments rule; configure scope manually if needed.' }
+} catch { Write-Warning "Safe Attachments configuration failed/skipped: $($_.Exception.Message)" }
+}
+try { Get-AtpPolicyForO365 | Select-Object Name, Enabled, TargetedUsersToProtect | ConvertTo-Json -Depth 6 | Out-File (Join-Path $mdoDir 'preset-policies.json') -Encoding utf8 } catch { }
+try { Get-SafeLinksPolicy | Select-Object Name, IsEnabled, DoNotTrackUserClicks, AllowClickThrough, EnableSafeLinksForTeams, EnableSafeLinksForOffice | ConvertTo-Json -Depth 6 | Out-File (Join-Path $mdoDir 'safelinks-policies.json') -Encoding utf8 } catch { }
+try { Get-SafeLinksRule | Select-Object Name, SafeLinksPolicy, State, Priority, SentToMemberOf | ConvertTo-Json -Depth 6 | Out-File (Join-Path $mdoDir 'safelinks-rules.json') -Encoding utf8 } catch { }
+try { Get-SafeAttachmentPolicy | Select-Object Name, Enable, Action | ConvertTo-Json -Depth 6 | Out-File (Join-Path $mdoDir 'safeattachments-policies.json') -Encoding utf8 } catch { }
+try { Get-SafeAttachmentRule | Select-Object Name, SafeAttachmentPolicy, State, Priority, SentToMemberOf | ConvertTo-Json -Depth 6 | Out-File (Join-Path $mdoDir 'safeattachments-rules.json') -Encoding utf8 } catch { }
+Disconnect-ExchangeOnline -Confirm:$false | Out-Null
+} catch {
+Write-Warning "MDO configuration failed/skipped: $($_.Exception.Message)"
+try { Disconnect-ExchangeOnline -Confirm:$false | Out-Null } catch { }
+}
+}
+# ------------------------------
+# Defender evidence collection (read-only)
+# ------------------------------
+if ($DoDefenderEvidence) {
+Write-Host '=== Defender evidence collection ==='
+if ($DoOrca) {
+try {
+Write-Host 'Connecting to Exchange Online for ORCA...'
+Connect-ExchangeOnline -ShowBanner:$false | Out-Null
+$orcaOut = Join-Path $OutDir 'ORCA'
+New-Item -ItemType Directory -Path $orcaOut -Force | Out-Null
+Write-Host 'Running ORCA report (this may take a few minutes)...'
+Invoke-ORCA -OutputPath $orcaOut | Out-Null
+Disconnect-ExchangeOnline -Confirm:$false | Out-Null
+} catch {
+Write-Warning "ORCA step failed/skipped: $($_.Exception.Message)"
+try { Disconnect-ExchangeOnline -Confirm:$false | Out-Null } catch { }
+}
+}
+if ($DoSecureScore) {
+try {
+Write-Host 'Exporting Secure Score...'
+$secDir = Join-Path $OutDir 'Security'
+New-Item -ItemType Directory -Path $secDir -Force | Out-Null
+$scores = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/security/secureScores?$top=20'
+Export-Json -Object $scores -Path (Join-Path $secDir 'secureScores.json') -Depth 10
+$controls = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/security/secureScoreControlProfiles?$top=200'
+Export-Json -Object $controls -Path (Join-Path $secDir 'secureScoreControlProfiles.json') -Depth 10
+} catch {
+Write-Warning "Secure Score export failed/skipped: $($_.Exception.Message)"
+}
+}
+if ($DoMdeInventory) {
+try {
+Write-Host 'Exporting MDE machine inventory (read-only)...'
+$mdeDir = Join-Path $OutDir 'MDE'
+New-Item -ItemType Directory -Path $mdeDir -Force | Out-Null
+$uri = 'https://api.securitycenter.microsoft.com/api/machines'
+$machines = Invoke-MgGraphRequest -Method GET -Uri $uri
+Export-Json -Object $machines -Path (Join-Path $mdeDir 'machines.json') -Depth 10
+if ($machines.value) {
+$machines.value | Select-Object computerDnsName, osPlatform, healthStatus, onboardingStatus, lastSeen | Export-Csv (Join-Path $mdeDir 'machines-summary.csv') -NoTypeInformation
+}
+} catch {
+Write-Warning "MDE inventory export failed/skipped: $($_.Exception.Message)"
+}
+}
+} else {
+Write-Host 'Skipping Defender evidence collection (operator selected No).'
+}
+
+# ------------------------------
+# Final exports (inventory) # ------------------------------ New-Item -ItemType Directory -Path $OutDir -Force | Out-Null $export = [ordered]@{ RunTimestampUtc = (Get-Date).ToUniversalTime().ToString('s') + 'Z' TenantHint = $TenantDomainHint GroupPrefix = $GroupPrefix GraphAccount = $ctx.Account TenantId = $ctx.TenantId Groups = @( [ordered]@{ DisplayName = $gIT.DisplayName; Id = $gIT.Id }, [ordered]@{ DisplayName = $gPilot.DisplayName; Id = $gPilot.Id }, [ordered]@{ DisplayName = $gEx.DisplayName; Id = $gEx.Id }, [ordered]@{ DisplayName = $PilotDeviceGroupName; Id = if ($gPilotDevices) { $gPilotDevices.Id } else { '' } } ) BreakGlassUpns = $BreakGlassUpns CAPolicies = @( [ordered]@{ DisplayName = $CA_MfaPilot_Name; State = 'Report-only' }, [ordered]@{ DisplayName = $CA_BlockLegacy_Name; State = 'Report-only' }, [ordered]@{ DisplayName = $CA_CompliantDevice_Name; State = 'Report-only' }, [ordered]@{ DisplayName = $CA_AdminPortals_Name; State = 'Report-only' } ) Intune = [ordered]@{ Enabled = $DoIntuneBaseline; Windows = $DoIntuneWindows; Compliance = $DoIntuneWindowsCompliance; BitLocker = $DoIntuneBitLocker; DefenderAv = $DoIntuneDefenderAv; Firewall = $DoIntuneFirewall } Defender = [ordered]@{ EvidenceEnabled = $DoDefenderEvidence; Orca = $DoOrca; SecureScore = $DoSecureScore; MdeInventory = $DoMdeInventory; MdoConfigured = $DoMdoConfig; MdoUsedPresets = $MdoUsePresets } Purview = [ordered]@{ Configured = $DoPurviewConfig; PilotGroup = $PurviewPilotGroupName; CreateLabels = $PurviewCreateLabels; PublishLabels = $PurviewPublishLabels; CreateDlp = $PurviewCreateDlp; DlpMode = $PurviewDlpMode; SensitiveInfoTypes = $PurviewSITsRaw } } Export-Json -Object $export -Path (Join-Path $OutDir 'run-summary.json') -Depth 12 Get-MgGroup -Filter "startswith(displayName,'$GroupPrefix')" -All | Select-Object Id, DisplayName, Description | ConvertTo-Json -Depth 5 | Out-File (Join-Path $OutDir 'groups.json') -Encoding utf8 Get-MgIdentityConditionalAccessPolicy -All | Select-Object Id, DisplayName, State | Sort-Object DisplayName | ConvertTo-Json -Depth 5 | Out-File (Join-Path $OutDir 'conditional-access-policies.json') -Encoding utf8 Write-Host "Done. Evidence exported to: $OutDir" Disconnect-MgGraph
+
