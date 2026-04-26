@@ -1,0 +1,248 @@
+#requires -Version 7.0
+param(
+[Parameter(Mandatory=$false)][string]$OutputPath = ".\\CopilotReadinessExport",
+[Parameter(Mandatory=$false)][string]$TenantDomain = "",
+[Parameter(Mandatory=$false)][string[]]$PilotUsersUpn = @(),
+[Parameter(Mandatory=$false)][switch]$SkipExchange,
+[Parameter(Mandatory=$false)][switch]$SkipTeams,
+[Parameter(Mandatory=$false)][switch]$SkipSharePoint
+)
+
+$ErrorActionPreference = "Stop"
+$scriptVersion = "0.1"
+
+function New-SnapshotId {
+return ([Guid]::NewGuid()).ToString()
+}
+
+function Ensure-Folder([string]$Path){
+if(-not (Test-Path $Path)){ New-Item -ItemType Directory -Path $Path | Out-Null }
+}
+
+function Write-Csv($Object, [string]$Path){
+$Object | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $Path
+}
+
+function Try-Run([string]$Name, [scriptblock]$Block){
+try {
+& $Block
+return $null
+} catch {
+return [pscustomobject]@{ Step=$Name; Error=$_.Exception.Message }
+}
+}
+
+Ensure-Folder $OutputPath
+$snapshotId = New-SnapshotId
+$runDateUtc = (Get-Date).ToUniversalTime().ToString("o")
+
+$errors = @()
+
+# -------------------------------
+# 1) Microsoft Graph (core)
+# -------------------------------
+$errors += Try-Run "Connect-MgGraph" {
+Import-Module Microsoft.Graph -ErrorAction Stop
+$scopes = @(
+"Organization.Read.All",
+"User.Read.All",
+"Directory.Read.All",
+"Policy.Read.All",
+"Group.Read.All"
+)
+Connect-MgGraph -Scopes $scopes | Out-Null
+}
+
+$org = $null
+$errors += Try-Run "Get-Org" {
+$org = Get-MgOrganization -Property Id,DisplayName,VerifiedDomains
+}
+
+$tenantId = $org.Id
+if([string]::IsNullOrWhiteSpace($TenantDomain)){
+$TenantDomain = ($org.VerifiedDomains | Where-Object {$_.IsDefault -eq $true} | Select-Object -First 1).Name
+}
+
+$snapshot = [pscustomobject]@{
+SnapshotId = $snapshotId
+TenantId = $tenantId
+TenantDomain = $TenantDomain
+TenantName = $org.DisplayName
+RunDateUtc = $runDateUtc
+ScriptVersion = $scriptVersion
+}
+Write-Csv @($snapshot) (Join-Path $OutputPath "TenantSnapshot.csv")
+
+# -------------------------------
+# 2) Users + licensing eligibility (high-level via Graph)
+# Note: Detailed SKU evaluation may require MSOnline/AzureAD or Graph beta endpoints.
+# -------------------------------
+$users = @()
+$errors += Try-Run "Get-Users" {
+$users = Get-MgUser -All -Property Id,DisplayName,UserPrincipalName,AccountEnabled,AssignedLicenses
+}
+
+# If pilot users provided, filter down for reporting clarity
+if($PilotUsersUpn.Count -gt 0){
+$users = $users | Where-Object { $PilotUsersUpn -contains $_.UserPrincipalName }
+}
+
+# Copilot add-on SKU GUIDs vary by cloud/offer. We detect presence by service plan name when available.
+# For a production script, map known SKUs in a config file per CSP/EA catalog export.
+
+$userRows = foreach($u in $users){
+[pscustomobject]@{
+SnapshotId = $snapshotId
+UserPrincipalName = $u.UserPrincipalName
+DisplayName = $u.DisplayName
+AccountEnabled = $u.AccountEnabled
+AssignedLicensesCount= ($u.AssignedLicenses | Measure-Object).Count
+HasCopilotAddOn = "Unknown"
+HasEligibleBaseSku = "Unknown"
+}
+}
+Write-Csv $userRows (Join-Path $OutputPath "Users_Licensing.csv")
+
+# -------------------------------
+# 3) Conditional Access policies
+# -------------------------------
+$ca = @()
+$errors += Try-Run "Get-ConditionalAccess" {
+$ca = Get-MgIdentityConditionalAccessPolicy -All
+}
+
+$caRows = foreach($p in $ca){
+[pscustomobject]@{
+SnapshotId = $snapshotId
+PolicyId = $p.Id
+Name = $p.DisplayName
+State = $p.State
+Created = $p.CreatedDateTime
+Modified = $p.ModifiedDateTime
+}
+}
+Write-Csv $caRows (Join-Path $OutputPath "Entra_ConditionalAccess.csv")
+
+# -------------------------------
+# 4) Directory role assignments (admin hygiene signal)
+# -------------------------------
+$roles = @()
+$errors += Try-Run "Get-DirectoryRoles" {
+$roles = Get-MgDirectoryRole -All
+}
+
+$roleAssignments = @()
+$errors += Try-Run "Get-RoleAssignments" {
+foreach($r in $roles){
+$members = Get-MgDirectoryRoleMember -DirectoryRoleId $r.Id -All
+foreach($m in $members){
+$roleAssignments += [pscustomobject]@{
+SnapshotId = $snapshotId
+RoleName = $r.DisplayName
+AssigneeId = $m.Id
+AssigneeType= $m.AdditionalProperties["@odata.type"]
+}
+}
+}
+}
+Write-Csv $roleAssignments (Join-Path $OutputPath "Entra_Roles.csv")
+
+# -------------------------------
+# 5) Teams + Groups posture (public/private, ownership)
+# -------------------------------
+$groupRows = @()
+$errors += Try-Run "Get-Groups" {
+$groups = Get-MgGroup -All -Property Id,DisplayName,Visibility,GroupTypes,ResourceProvisioningOptions,CreatedDateTime
+foreach($g in $groups){
+$isM365Group = ($g.GroupTypes -contains "Unified")
+$hasTeam = ($g.ResourceProvisioningOptions -contains "Team")
+if($isM365Group -or $hasTeam){
+$owners = Get-MgGroupOwner -GroupId $g.Id -All
+$members = Get-MgGroupMember -GroupId $g.Id -All
+$groupRows += [pscustomobject]@{
+SnapshotId = $snapshotId
+GroupId = $g.Id
+DisplayName = $g.DisplayName
+Visibility = $g.Visibility
+HasTeam = $hasTeam
+OwnersCount = ($owners | Measure-Object).Count
+MembersCount = ($members | Measure-Object).Count
+CreatedDateTime = $g.CreatedDateTime
+}
+}
+}
+}
+Write-Csv $groupRows (Join-Path $OutputPath "Teams_Groups.csv")
+
+# -------------------------------
+# 6) SharePoint Online tenant sharing settings
+# -------------------------------
+$spoRow = @()
+if(-not $SkipSharePoint){
+$errors += Try-Run "Get-SPOTenant" {
+Import-Module Microsoft.Online.SharePoint.PowerShell -ErrorAction Stop
+# Connect-SPOService requires admin URL. Derive from tenant domain when possible.
+$adminUrl = "https://" + ($TenantDomain.Split('.')[0]) + "-admin.sharepoint.com"
+Connect-SPOService -Url $adminUrl
+$tenant = Get-SPOTenant
+$spoRow = [pscustomobject]@{
+SnapshotId = $snapshotId
+SharingCapability = $tenant.SharingCapability
+DefaultSharingLinkType = $tenant.DefaultSharingLinkType
+DefaultLinkPermission = $tenant.DefaultLinkPermission
+RequireAcceptingAccountMatchInvitedAccount = $tenant.RequireAcceptingAccountMatchInvitedAccount
+AllowedDomainList = ($tenant.AllowedDomainList -join ";")
+BlockedDomainList = ($tenant.BlockedDomainList -join ";")
+}
+}
+if($spoRow){ Write-Csv @($spoRow) (Join-Path $OutputPath "SharePoint_TenantSharing.csv") }
+}
+
+# -------------------------------
+# 7) Exchange Online mailbox prerequisite (basic inventory)
+# -------------------------------
+if(-not $SkipExchange){
+$errors += Try-Run "ExchangeOnline" {
+Import-Module ExchangeOnlineManagement -ErrorAction Stop
+Connect-ExchangeOnline -ShowBanner:$false
+$mbx = Get-EXOMailbox -ResultSize Unlimited -Properties DisplayName,UserPrincipalName,RecipientTypeDetails,IsMailboxEnabled
+$mbxRows = $mbx | Select-Object @{n="SnapshotId";e={$snapshotId}},DisplayName,UserPrincipalName,RecipientTypeDetails,IsMailboxEnabled
+Write-Csv $mbxRows (Join-Path $OutputPath "Exchange_Mailboxes.csv")
+Disconnect-ExchangeOnline -Confirm:$false
+}
+}
+
+# -------------------------------
+# 8) Purview labels (best-effort)
+# Note: Purview APIs vary by licensing/endpoint; this section is optional and may be replaced with admin exports.
+# -------------------------------
+$purviewRows = @()
+$errors += Try-Run "PurviewLabels" {
+# Placeholder: if you have a preferred method (Purview PowerShell / Graph endpoints) we can wire it in.
+# For now, export an empty file so the model remains consistent.
+$purviewRows = @()
+Write-Csv $purviewRows (Join-Path $OutputPath "Purview_Labels.csv")
+}
+
+# -------------------------------
+# 9) Compute simple scores (placeholder logic)
+# Replace with your scoring rules as you operationalise the assessment.
+# -------------------------------
+$scores = @(
+[pscustomobject]@{SnapshotId=$snapshotId;Domain="Licensing & prerequisites";Score=0;Priority="P0";Notes="Populate after SKU mapping"},
+[pscustomobject]@{SnapshotId=$snapshotId;Domain="Identity & access";Score=0;Priority="P0";Notes="Populate after MFA/CA checks"},
+[pscustomobject]@{SnapshotId=$snapshotId;Domain="Endpoint & network";Score=0;Priority="P1";Notes="Populate after device/apps inventory"},
+[pscustomobject]@{SnapshotId=$snapshotId;Domain="Data governance & permissions";Score=0;Priority="P0";Notes="Populate after SPO link inventory"},
+[pscustomobject]@{SnapshotId=$snapshotId;Domain="Purview protection & compliance";Score=0;Priority="P0";Notes="Populate after label/DLP checks"},
+[pscustomobject]@{SnapshotId=$snapshotId;Domain="Security monitoring & operations";Score=0;Priority="P1";Notes="Populate after ops review"}
+)
+Write-Csv $scores (Join-Path $OutputPath "Summary_Scores.csv")
+
+# -------------------------------
+# 10) Export errors (if any) for transparency
+# -------------------------------
+if($errors | Where-Object { $_ -ne $null }){
+Write-Csv ($errors | Where-Object { $_ -ne $null }) (Join-Path $OutputPath "Run_Errors.csv")
+}
+
+Write-Host "Done. SnapshotId: $snapshotId"
