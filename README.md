@@ -224,4 +224,4 @@ Keep documented rollback: remove user from scope group or flip policy back to re
 ✅ **Troubleshooting Table**: Easy reference for common issues
 ✅ **White Space**: Reduced density with strategic breaks and horizontal rules
 
-Would you like me to push these changes to the repository?
+
