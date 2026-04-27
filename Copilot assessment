@@ -118,3 +118,204 @@ Write-Csv $caRows (Join-Path $OutputPath "Entra_ConditionalAccess.csv")
 $roles = @(); $errors += Try-Run "Get-DirectoryRoles" { $roles = Get-MgDirectoryRole -All }
 $roleAssignments = @();
 $errors += Try-Run "Get-RoleAssignments" {
+  foreach($r in $roles){
+    $members = Get-MgDirectoryRoleMember -DirectoryRoleId $r.Id -All
+    foreach($m in $members){ $roleAssignments += [pscustomobject]@{ SnapshotId=$snapshotId; RoleName=$r.DisplayName; AssigneeId=$m.Id; AssigneeType=$m.AdditionalProperties["@odata.type"] } }
+  }
+}
+Write-Csv $roleAssignments (Join-Path $OutputPath "Entra_Roles.csv")
+
+# -------------------------------
+# 5) Teams + Groups posture (via Graph)
+# -------------------------------
+$groupRows = @();
+$errors += Try-Run "Get-Groups" {
+  $groups = Get-MgGroup -All -Property Id,DisplayName,Visibility,GroupTypes,ResourceProvisioningOptions,CreatedDateTime
+  foreach($g in $groups){
+    $isM365Group = ($g.GroupTypes -contains "Unified"); $hasTeam = ($g.ResourceProvisioningOptions -contains "Team")
+    if($isM365Group -or $hasTeam){
+      $owners = Get-MgGroupOwner -GroupId $g.Id -All; $members = Get-MgGroupMember -GroupId $g.Id -All
+      $groupRows += [pscustomobject]@{ SnapshotId=$snapshotId; GroupId=$g.Id; DisplayName=$g.DisplayName; Visibility=$g.Visibility; HasTeam=$hasTeam; OwnersCount=($owners|Measure-Object).Count; MembersCount=($members|Measure-Object).Count; CreatedDateTime=$g.CreatedDateTime }
+    }
+  }
+}
+Write-Csv $groupRows (Join-Path $OutputPath "Teams_Groups.csv")
+
+# -------------------------------
+# 6) SharePoint tenant sharing settings (SPO shell)
+# -------------------------------
+$spoRow = @()
+if(-not $SkipSharePoint){
+  $errors += Try-Run "Get-SPOTenant" {
+    Import-Module Microsoft.Online.SharePoint.PowerShell -ErrorAction Stop
+    $adminUrl = if([string]::IsNullOrWhiteSpace($PnPTenantAdminUrl)){ "https://" + ($TenantDomain.Split('.')[0]) + "-admin.sharepoint.com" } else { $PnPTenantAdminUrl }
+    Connect-SPOService -Url $adminUrl
+    $tenant = Get-SPOTenant
+    $spoRow = [pscustomobject]@{ SnapshotId=$snapshotId; SharingCapability=$tenant.SharingCapability; DefaultSharingLinkType=$tenant.DefaultSharingLinkType; DefaultLinkPermission=$tenant.DefaultLinkPermission; RequireAcceptingAccountMatchInvitedAccount=$tenant.RequireAcceptingAccountMatchInvitedAccount; AllowedDomainList=($tenant.AllowedDomainList -join ";"); BlockedDomainList=($tenant.BlockedDomainList -join ";") }
+  }
+  if($spoRow){ Write-Csv @($spoRow) (Join-Path $OutputPath "SharePoint_TenantSharing.csv") }
+}
+
+# -------------------------------
+# 7) SharePoint sharing link inventory (PnP) — top sites first
+# -------------------------------
+if($IncludeSharingLinks -and -not $SkipSharePoint){
+  $errors += Try-Run "PnP-SharingLinks" {
+    Import-Module PnP.PowerShell -ErrorAction Stop
+    $adminUrl = if([string]::IsNullOrWhiteSpace($PnPTenantAdminUrl)){ "https://" + ($TenantDomain.Split('.')[0]) + "-admin.sharepoint.com" } else { $PnPTenantAdminUrl }
+    Connect-PnPOnline -Url $adminUrl -Interactive
+    $sites = Get-PnPTenantSite -IncludeOneDriveSites:$false -Detailed -ErrorAction Stop | Where-Object { $_.Url -like "https://*sharepoint.com/sites/*" }
+    $sites = $sites | Sort-Object -Property StorageUsageCurrent -Descending | Select-Object -First $TopSites
+    $linkRows = @()
+    foreach($s in $sites){
+      Connect-PnPOnline -Url $s.Url -Interactive
+      $lists = Get-PnPList | Where-Object { $_.BaseTemplate -eq 101 -and $_.Hidden -eq $false }
+      foreach($list in $lists){
+        $items = Get-PnPListItem -List $list -PageSize 500 -Fields "FileRef","FileLeafRef" -ErrorAction SilentlyContinue
+        foreach($it in $items){
+          $ref = $it.FieldValues["FileRef"]; if([string]::IsNullOrWhiteSpace($ref)){ continue }
+          $sharingLinks = Get-PnPFileSharingLink -Identity $ref -ErrorAction SilentlyContinue
+          foreach($sl in $sharingLinks){
+            $linkRows += [pscustomobject]@{ SnapshotId=$snapshotId; SiteUrl=$s.Url; ListTitle=$list.Title; Name=$it.FieldValues["FileLeafRef"]; RelativeUrl=$ref; ShareLinkUrl=$sl.Link.WebUrl; ShareLinkType=$sl.Link.Type; ShareLinkScope=$sl.Link.Scope; Expiration=$sl.ExpirationDateTime; RequiresPassword=$sl.HasPassword }
+          }
+        }
+      }
+    }
+    Write-Csv $linkRows (Join-Path $OutputPath "SharePoint_SharingLinks_TopSites.csv")
+  }
+}
+
+# -------------------------------
+# 8) MFA method coverage (Graph)
+# -------------------------------
+if($IncludeMfaMethods){
+  $errors += Try-Run "MFA-Methods" {
+    Import-Module Microsoft.Graph.Identity.SignIns -ErrorAction Stop
+    $mfaRows = @()
+    foreach($u in $users){
+      $methods = Get-MgUserAuthenticationMethod -UserId $u.Id -All -ErrorAction SilentlyContinue
+      $methodTypes = @($methods | ForEach-Object { $_.AdditionalProperties["@odata.type"] })
+      $nonPassword = $methodTypes | Where-Object { $_ -and $_ -notmatch "passwordAuthenticationMethod" }
+      $mfaRows += [pscustomobject]@{ SnapshotId=$snapshotId; UserPrincipalName=$u.UserPrincipalName; DisplayName=$u.DisplayName; AuthMethodTypes=($methodTypes -join "|"); StrongAuthRegistered=(($nonPassword.Count -gt 0)); AuthMethodsCount=$methodTypes.Count }
+    }
+    Write-Csv $mfaRows (Join-Path $OutputPath "Entra_MFA_Methods.csv")
+  }
+}
+
+# -------------------------------
+# 9) Exchange Online mailbox inventory
+# -------------------------------
+if(-not $SkipExchange){
+  $errors += Try-Run "ExchangeOnline" {
+    Import-Module ExchangeOnlineManagement -ErrorAction Stop
+    Connect-ExchangeOnline -ShowBanner:$false
+    $mbx = Get-EXOMailbox -ResultSize Unlimited -Properties DisplayName,UserPrincipalName,RecipientTypeDetails,IsMailboxEnabled
+    $mbxRows = $mbx | Select-Object @{n="SnapshotId";e={$snapshotId}},DisplayName,UserPrincipalName,RecipientTypeDetails,IsMailboxEnabled
+    Write-Csv $mbxRows (Join-Path $OutputPath "Exchange_Mailboxes.csv")
+    Disconnect-ExchangeOnline -Confirm:$false
+  }
+}
+
+# -------------------------------
+# 10) Purview: labels + label policies + DLP policies (S&C PowerShell)
+# -------------------------------
+if($IncludePurview -or $IncludeDataClassification){
+  $errors += Try-Run "Purview-Connect" {
+    Import-Module ExchangeOnlineManagement -ErrorAction Stop
+    Connect-IPPSSession | Out-Null
+  }
+}
+
+if($IncludePurview){
+  $errors += Try-Run "Purview-Labels" {
+    $labels = Get-Label -ErrorAction Stop
+    $labelRows = foreach($l in $labels){ [pscustomobject]@{ SnapshotId=$snapshotId; LabelId=$l.ImmutableId; LabelName=$l.DisplayName; Enabled=$l.Disabled -ne $true; Priority=$l.Priority; ContentType=$l.ContentType } }
+    Write-Csv $labelRows (Join-Path $OutputPath "Purview_Labels.csv")
+  }
+  $errors += Try-Run "Purview-LabelPolicies" {
+    $policies = Get-LabelPolicy -ErrorAction Stop
+    $policyRows = foreach($p in $policies){ [pscustomobject]@{ SnapshotId=$snapshotId; PolicyName=$p.DisplayName; Mode=$p.Mode; DistributionStatus=$p.DistributionStatus; Locations=($p.ExchangeLocation -join "|") } }
+    Write-Csv $policyRows (Join-Path $OutputPath "Purview_LabelPolicies.csv")
+  }
+  $errors += Try-Run "Purview-DlpPolicies" {
+    $dlp = Get-DlpCompliancePolicy -ErrorAction Stop
+    $dlpRows = foreach($d in $dlp){ [pscustomobject]@{ SnapshotId=$snapshotId; PolicyName=$d.Name; Mode=$d.Mode; Workload=$d.Workload; Enabled=$d.Enabled } }
+    Write-Csv $dlpRows (Join-Path $OutputPath "Purview_DlpPolicies.csv")
+  }
+}
+
+# -------------------------------
+# 11) Purview data classification discovery: SITs + trainable classifier usage in policies
+# -------------------------------
+if($IncludeDataClassification){
+  $errors += Try-Run "Purview-SITs" {
+    $sits = Get-DlpSensitiveInformationType -ErrorAction Stop
+    $sitRows = foreach($s in $sits){ [pscustomobject]@{ SnapshotId=$snapshotId; Name=$s.Name; Id=$s.Id; Publisher=$s.Publisher; RecommendedConfidence=$s.RecommendedConfidence } }
+    Write-Csv $sitRows (Join-Path $OutputPath "Purview_SITs.csv")
+  }
+
+  $errors += Try-Run "Purview-AutoLabelRules" {
+    $auto = Get-AutoSensitivityLabelRule -ErrorAction Stop
+    $autoRows = foreach($r in $auto){ [pscustomobject]@{ SnapshotId=$snapshotId; RuleName=$r.Name; Mode=$r.Mode; Enabled=$r.Enabled; Workload=($r.Workload -join "|") } }
+    Write-Csv $autoRows (Join-Path $OutputPath "Purview_AutoLabelRules.csv")
+  }
+
+  $errors += Try-Run "Purview-DlpRules" {
+    $rules = Get-DlpComplianceRule -ErrorAction Stop
+    $ruleRows = foreach($r in $rules){ [pscustomobject]@{ SnapshotId=$snapshotId; RuleName=$r.Name; PolicyName=$r.ParentPolicyName; Mode=$r.Mode; Enabled=$r.Enabled } }
+    Write-Csv $ruleRows (Join-Path $OutputPath "Purview_DlpRules.csv")
+  }
+
+  $errors += Try-Run "Purview-TrainableClassifierUsage" {
+    $usage = @()
+    $auto = @(); $dlp = @()
+    try { $auto = Get-AutoSensitivityLabelRule -ErrorAction Stop } catch {}
+    try { $dlp = Get-DlpComplianceRule -ErrorAction Stop } catch {}
+
+    foreach($r in $auto){
+      if([string]::IsNullOrWhiteSpace($r.AdvancedRule)){ continue }
+      if($r.AdvancedRule -notmatch 'MLModel'){ continue }
+      $obj = Try-ParseJson $r.AdvancedRule; if(-not $obj){ continue }
+      $json = $obj | ConvertTo-Json -Depth 30
+      $matches = ([regex]::Matches($json,'"Name"\s*:\s*"([^"]+)"\s*,\s*"ClassifierType"\s*:\s*"MLModel"'))
+      foreach($m in $matches){
+        $usage += [pscustomobject]@{ SnapshotId=$snapshotId; PolicyType="AutoLabel"; RuleName=$r.Name; ClassifierName=$m.Groups[1].Value }
+      }
+    }
+
+    foreach($r in $dlp){
+      if([string]::IsNullOrWhiteSpace($r.AdvancedRule)){ continue }
+      if($r.AdvancedRule -notmatch 'MLModel'){ continue }
+      $obj = Try-ParseJson $r.AdvancedRule; if(-not $obj){ continue }
+      $json = $obj | ConvertTo-Json -Depth 30
+      $matches = ([regex]::Matches($json,'"Name"\s*:\s*"([^"]+)"\s*,\s*"ClassifierType"\s*:\s*"MLModel"'))
+      foreach($m in $matches){
+        $usage += [pscustomobject]@{ SnapshotId=$snapshotId; PolicyType="DLP"; RuleName=$r.Name; ClassifierName=$m.Groups[1].Value }
+      }
+    }
+
+    $usage = $usage | Sort-Object PolicyType,RuleName,ClassifierName -Unique
+    Write-Csv $usage (Join-Path $OutputPath "Purview_TrainableClassifiers_Usage.csv")
+  }
+}
+
+# -------------------------------
+# 12) Compute simple scores (placeholder logic)
+# -------------------------------
+$scores = @(
+  [pscustomobject]@{SnapshotId=$snapshotId;Domain="Licensing & prerequisites";Score=0;Priority="P0";Notes= if($skuMap){"Computed via sku-map.json"} else {"No SKU map provided"}},
+  [pscustomobject]@{SnapshotId=$snapshotId;Domain="Identity & access";Score=0;Priority="P0";Notes= if($IncludeMfaMethods){"Includes registered MFA methods export"} else {"No MFA method export"}},
+  [pscustomobject]@{SnapshotId=$snapshotId;Domain="Endpoint & network";Score=0;Priority="P1";Notes="Populate after device/apps inventory"},
+  [pscustomobject]@{SnapshotId=$snapshotId;Domain="Data governance & permissions";Score=0;Priority="P0";Notes= if($IncludeSharingLinks){"Includes top-site sharing links inventory"} else {"No sharing links inventory"}},
+  [pscustomobject]@{SnapshotId=$snapshotId;Domain="Purview protection & compliance";Score=0;Priority="P0";Notes= if($IncludePurview){"Includes labels/policies/DLP exports"} else {"No Purview exports"}},
+  [pscustomobject]@{SnapshotId=$snapshotId;Domain="Sensitive information discovery";Score=0;Priority="P0";Notes= if($IncludeDataClassification){"Includes SITs and trainable classifier usage exports"} else {"No classification exports"}},
+  [pscustomobject]@{SnapshotId=$snapshotId;Domain="Security monitoring & operations";Score=0;Priority="P1";Notes="Populate after ops review"}
+)
+Write-Csv $scores (Join-Path $OutputPath "Summary_Scores.csv")
+
+# -------------------------------
+# 13) Export errors (if any) for transparency
+# -------------------------------
+if($errors | Where-Object { $_ -ne $null }){ Write-Csv ($errors | Where-Object { $_ -ne $null }) (Join-Path $OutputPath "Run_Errors.csv") }
+
+Write-Host "Done. SnapshotId: $snapshotId"
