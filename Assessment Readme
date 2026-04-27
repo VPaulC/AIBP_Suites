@@ -1,62 +1,142 @@
-To run the updated Copilot readiness export script (v0.2), do this from a secure admin workstation.
-1) Save the script + create the SKU map file
-1.	Copy the script out of Appendix A and save it as, for example:
-CopilotReadinessExport.ps1
-2.	In the same folder, create sku-map.json (unless you plan to pass -SkuMapPath to another location).
-Example sku-map.json shape (you’ll fill in the exact part numbers you care about):
-{
-  "EligibleBaseSkuPartNumbers": [
-    "SPB", 
-    "SPE_E3",
-    "SPE_E5"
-  ],
-  "CopilotSkuPartNumbers": [
-    "MICROSOFT_365_COPILOT"
-  ]
-}
-2) Open PowerShell and install required modules (first run only)
-Run PowerShell 7 (recommended), then:
-Install-Module Microsoft.Graph -Scope CurrentUser
-Install-Module ExchangeOnlineManagement -Scope CurrentUser
-Install-Module Microsoft.Online.SharePoint.PowerShell -Scope CurrentUser
-Install-Module PnP.PowerShell -Scope CurrentUser
-3) Choose your “run mode” (baseline vs full)
-A) Baseline run (Graph + CA + roles + groups + SPO tenant settings + EXO mailboxes)
+### GitHub README — Usage examples (copy/paste)
+
+## Quick start (baseline)
+
+Exports core readiness signals (Graph + CA + roles + groups + SPO tenant sharing + EXO mailboxes).
+
+```powershell
 .\CopilotReadinessExport.ps1 -OutputPath ".\Out"
-B) Full run (adds sharing links + MFA methods + Purview exports)
+```
+
+## Full run (recommended for assessments)
+
+Adds sharing links, MFA method registration, Purview exports, plus SIT/trainable classifier discovery.
+
+```powershell
 .\CopilotReadinessExport.ps1 `
   -OutputPath ".\Out" `
   -IncludeSharingLinks -TopSites 25 `
   -IncludeMfaMethods `
+  -IncludePurview `
+  -IncludeDataClassification
+```
+
+## Pilot-only run (faster / safer for first test)
+
+Scope the user-based exports to a known pilot group.
+
+```powershell
+.\CopilotReadinessExport.ps1 `
+  -OutputPath ".\Out" `
+  -PilotUsersUpn @("user1@domain.com","user2@domain.com") `
+  -IncludeMfaMethods `
   -IncludePurview
-4) What prompts to expect
-•	Graph sign-in: you’ll be prompted to consent to the requested scopes (and sign in).
-•	SharePoint (PnP): Connect-PnPOnline -Interactive will prompt you (often once per site in the current implementation).
-•	SharePoint admin shell: Connect-SPOService prompts for SPO admin sign-in.
-•	Exchange Online: Connect-ExchangeOnline prompts for sign-in.
-•	Purview: Connect-IPPSSession prompts for sign-in.
-If any area fails due to permissions/module availability, the script will still produce partial outputs and write details to:
-•	Run_Errors.csv
-5) Where the outputs go (for Power BI)
-In your -OutputPath folder you should see (at minimum):
-•	TenantSnapshot.csv
-•	Users_Licensing.csv
-•	Entra_ConditionalAccess.csv
-•	Entra_Roles.csv
-•	Teams_Groups.csv
-•	SharePoint_TenantSharing.csv
-•	Exchange_Mailboxes.csv
-•	Summary_Scores.csv
-•	Run_Errors.csv (only if something fails)
-If you enabled the switches:
-•	SharePoint_SharingLinks_TopSites.csv (when -IncludeSharingLinks)
-•	Entra_MFA_Methods.csv (when -IncludeMfaMethods)
-•	Purview_Labels.csv, Purview_LabelPolicies.csv, Purview_DlpPolicies.csv (when -IncludePurview)
-6) Optional: run for pilot users only (faster)
-.\CopilotReadinessExport.ps1 -OutputPath ".\Out" -PilotUsersUpn @("user1@domain.com","user2@domain.com") -IncludeMfaMethods
-Key takeaways
-•	Save the script as a .ps1 + create sku-map.json in the same folder.
-•	Start with the baseline run, then add -IncludeSharingLinks, -IncludeMfaMethods, -IncludePurview as permissions allow.
-Use Run_Errors.csv to quickly see what didn’t export (and why).Source reference: Internal repo path (if applicable)
-Purpose: Collect tenant configuration signals relevant to Microsoft 365 Copilot readiness and export CSV files for Power BI ingestion. The script is read-only and uses Microsoft Graph plus service-specific modules where available.
-Prerequisites: PowerShell 7 recommended; modules: Microsoft.Graph, MicrosoftTeams, ExchangeOnlineManagement, Microsoft.Online.SharePoint.PowerShell (or PnP.PowerShell if preferred). Required least-privilege roles vary by customer; aim for Global Reader plus SharePoint/Teams read scopes. If some modules/permissions are not available, the script will still export partial results and record gaps.
+```
+
+## Use a custom SKU map path
+
+Helpful if you keep mappings in a `config` folder.
+
+```powershell
+.\CopilotReadinessExport.ps1 `
+  -OutputPath ".\Out" `
+  -SkuMapPath ".\config\sku-map.json"
+```
+
+## Specify SharePoint admin URL explicitly
+
+Recommended when tenants have non-standard domains or you want to avoid auto-derivation.
+
+```powershell
+.\CopilotReadinessExport.ps1 `
+  -OutputPath ".\Out" `
+  -PnPTenantAdminUrl "https://<tenant>-admin.sharepoint.com" `
+  -IncludeSharingLinks -TopSites 25
+```
+
+## Reduce SharePoint workload (throttling-friendly)
+
+```powershell
+.\CopilotReadinessExport.ps1 `
+  -OutputPath ".\Out" `
+  -IncludeSharingLinks -TopSites 10
+```
+
+## Skip specific workloads (troubleshooting)
+
+### Skip Exchange Online
+
+```powershell
+.\CopilotReadinessExport.ps1 -OutputPath ".\Out" -SkipExchange
+```
+
+### Skip SharePoint (both SPO settings + PnP inventory)
+
+```powershell
+.\CopilotReadinessExport.ps1 -OutputPath ".\Out" -SkipSharePoint
+```
+
+## What you get (outputs)
+
+At minimum (baseline):
+
+*   `TenantSnapshot.csv`
+*   `Users_Licensing.csv`
+*   `Entra_ConditionalAccess.csv`
+*   `Entra_Roles.csv`
+*   `Teams_Groups.csv`
+*   `SharePoint_TenantSharing.csv`
+*   `Exchange_Mailboxes.csv` (unless `-SkipExchange`)
+*   `Summary_Scores.csv`
+*   `Run_Errors.csv` (only if something fails)
+
+When switches are enabled:
+
+*   `-IncludeSharingLinks` → `SharePoint_SharingLinks_TopSites.csv`
+*   `-IncludeMfaMethods` → `Entra_MFA_Methods.csv`
+*   `-IncludePurview` → `Purview_Labels.csv`, `Purview_LabelPolicies.csv`, `Purview_DlpPolicies.csv`
+*   `-IncludeDataClassification` → `Purview_SITs.csv`, `Purview_AutoLabelRules.csv`, `Purview_DlpRules.csv`, `Purview_TrainableClassifiers_Usage.csv`
+
+## Evidence collection (sensitive content counts) — optional
+
+These are typically run separately with Security & Compliance PowerShell due to higher permissions.
+
+### Content Explorer (paged export example)
+
+```powershell
+Connect-IPPSSession
+
+$pageCookie = $null
+do {
+  $resp = Export-ContentExplorerData `
+    -TagType SensitiveInformationType `
+    -TagName "Credit Card Number" `
+    -Workload EXO `
+    -PageSize 500 `
+    -PageCookie $pageCookie
+
+  $meta = $resp[0]
+  $rows = $resp[1..($resp.Count-1)]
+  $rows | Export-Csv -NoTypeInformation -Append -Encoding UTF8 -Path ".\Out\Purview_ContentExplorer_SIT_CreditCard_EXO.csv"
+
+  $pageCookie = $meta.PageCookie
+} while ($meta.MorePagesAvailable -eq $true)
+```
+
+### Activity Explorer (last 30 days example)
+
+```powershell
+Connect-IPPSSession
+
+$start = (Get-Date).AddDays(-30)
+$end   = Get-Date
+
+Export-ActivityExplorerData -StartTime $start -EndTime $end -OutputFormat Csv |
+  Export-Csv -NoTypeInformation -Encoding UTF8 -Path ".\Out\Purview_ActivityExplorer_Last30Days.csv"
+```
+
+## Key takeaways
+
+*   Use **baseline** first, then layer on switches.
+*   `Run_Errors.csv` is the quickest way to diagnose missing permissions/modules.
+*   For **sensitive content counts**, use the optional **Content/Activity Explorer** export workflow separately (higher privilege).
