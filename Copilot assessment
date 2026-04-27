@@ -1,48 +1,51 @@
 #requires -Version 7.0
 param(
-[Parameter(Mandatory=$false)][string]$OutputPath = ".\\CopilotReadinessExport",
-[Parameter(Mandatory=$false)][string]$TenantDomain = "",
-[Parameter(Mandatory=$false)][string[]]$PilotUsersUpn = @(),
-[Parameter(Mandatory=$false)][string]$SkuMapPath = ".\\sku-map.json",
-[Parameter(Mandatory=$false)][string]$PnPTenantAdminUrl = "",
-[Parameter(Mandatory=$false)][int]$TopSites = 25,
-[Parameter(Mandatory=$false)][switch]$IncludeSharingLinks,
-[Parameter(Mandatory=$false)][switch]$IncludeMfaMethods,
-[Parameter(Mandatory=$false)][switch]$IncludePurview,
-[Parameter(Mandatory=$false)][switch]$SkipExchange,
-[Parameter(Mandatory=$false)][switch]$SkipTeams,
-[Parameter(Mandatory=$false)][switch]$SkipSharePoint
+  [Parameter(Mandatory=$false)][string]$OutputPath = ".\CopilotReadinessExport",
+  [Parameter(Mandatory=$false)][string]$TenantDomain = "",
+  [Parameter(Mandatory=$false)][string[]]$PilotUsersUpn = @(),
+  [Parameter(Mandatory=$false)][string]$SkuMapPath = ".\sku-map.json",
+  [Parameter(Mandatory=$false)][string]$PnPTenantAdminUrl = "",
+  [Parameter(Mandatory=$false)][int]$TopSites = 25,
+  [Parameter(Mandatory=$false)][switch]$IncludeSharingLinks,
+  [Parameter(Mandatory=$false)][switch]$IncludeMfaMethods,
+  [Parameter(Mandatory=$false)][switch]$IncludePurview,
+  [Parameter(Mandatory=$false)][switch]$IncludeDataClassification,
+  [Parameter(Mandatory=$false)][switch]$SkipExchange,
+  [Parameter(Mandatory=$false)][switch]$SkipTeams,
+  [Parameter(Mandatory=$false)][switch]$SkipSharePoint
 )
 
 $ErrorActionPreference = "Stop"
-$scriptVersion = "0.2"
+$scriptVersion = "0.3"
 
 function New-SnapshotId { return ([Guid]::NewGuid()).ToString() }
 function Ensure-Folder([string]$Path){ if(-not (Test-Path $Path)){ New-Item -ItemType Directory -Path $Path | Out-Null } }
 function Write-Csv($Object, [string]$Path){ $Object | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $Path }
 function Try-Run([string]$Name, [scriptblock]$Block){
-try { & $Block; return $null } catch { return [pscustomobject]@{ Step=$Name; Error=$_.Exception.Message } }
+  try { & $Block; return $null } catch { return [pscustomobject]@{ Step=$Name; Error=$_.Exception.Message } }
 }
 
 function Read-SkuMap([string]$Path){
-if(Test-Path $Path){
-return (Get-Content -Raw -Path $Path | ConvertFrom-Json)
-}
-return $null
+  if(Test-Path $Path){ return (Get-Content -Raw -Path $Path | ConvertFrom-Json) }
+  return $null
 }
 
 function Resolve-SkuIdsFromPartNumbers($subscribedSkus, [string[]]$partNumbers){
-$ids = @()
-foreach($pn in $partNumbers){
-$match = $subscribedSkus | Where-Object { $_.SkuPartNumber -eq $pn } | Select-Object -First 1
-if($match){ $ids += $match.SkuId }
-}
-return $ids
+  $ids = @()
+  foreach($pn in $partNumbers){
+    $match = $subscribedSkus | Where-Object { $_.SkuPartNumber -eq $pn } | Select-Object -First 1
+    if($match){ $ids += $match.SkuId }
+  }
+  return $ids
 }
 
 function Test-UserHasAnySkuId($userSkuIds, $wantedSkuIds){
-foreach($id in $wantedSkuIds){ if($userSkuIds -contains $id){ return $true } }
-return $false
+  foreach($id in $wantedSkuIds){ if($userSkuIds -contains $id){ return $true } }
+  return $false
+}
+
+function Try-ParseJson($text){
+  try { return ($text | ConvertFrom-Json -ErrorAction Stop) } catch { return $null }
 }
 
 Ensure-Folder $OutputPath
@@ -54,263 +57,64 @@ $errors = @()
 # 1) Microsoft Graph (core)
 # -------------------------------
 $errors += Try-Run "Connect-MgGraph" {
-Import-Module Microsoft.Graph -ErrorAction Stop
-$scopes = @(
-"Organization.Read.All",
-"User.Read.All",
-"Directory.Read.All",
-"Policy.Read.All",
-"Group.Read.All",
-"LicenseAssignment.Read.All"
-)
-if($IncludeMfaMethods){ $scopes += "UserAuthenticationMethod.Read.All" }
-Connect-MgGraph -Scopes ($scopes | Select-Object -Unique) | Out-Null
+  Import-Module Microsoft.Graph -ErrorAction Stop
+  $scopes = @("Organization.Read.All","User.Read.All","Directory.Read.All","Policy.Read.All","Group.Read.All","LicenseAssignment.Read.All")
+  if($IncludeMfaMethods){ $scopes += "UserAuthenticationMethod.Read.All" }
+  Connect-MgGraph -Scopes ($scopes | Select-Object -Unique) | Out-Null
 }
 
 $org = $null
 $errors += Try-Run "Get-Org" { $org = Get-MgOrganization -Property Id,DisplayName,VerifiedDomains }
-
 $tenantId = $org.Id
-if([string]::IsNullOrWhiteSpace($TenantDomain)){
-$TenantDomain = ($org.VerifiedDomains | Where-Object {$_.IsDefault -eq $true} | Select-Object -First 1).Name
-}
+if([string]::IsNullOrWhiteSpace($TenantDomain)){ $TenantDomain = ($org.VerifiedDomains | Where-Object {$_.IsDefault -eq $true} | Select-Object -First 1).Name }
 
 $snapshot = [pscustomobject]@{ SnapshotId=$snapshotId; TenantId=$tenantId; TenantDomain=$TenantDomain; TenantName=$org.DisplayName; RunDateUtc=$runDateUtc; ScriptVersion=$scriptVersion }
 Write-Csv @($snapshot) (Join-Path $OutputPath "TenantSnapshot.csv")
 
 # -------------------------------
-# 2) Licensing: compute HasCopilotAddOn / HasEligibleBaseSku using JSON config + Graph
+# 2) Licensing (via sku-map.json + Graph)
 # -------------------------------
 $skuMap = Read-SkuMap $SkuMapPath
 $subscribedSkus = @()
 $errors += Try-Run "Get-SubscribedSkus" { $subscribedSkus = Get-MgSubscribedSku -All }
 
-$eligibleBaseSkuIds = @()
-$copilotSkuIds = @()
+$eligibleBaseSkuIds = @(); $copilotSkuIds = @()
 if($skuMap){
-$eligibleBaseSkuIds = Resolve-SkuIdsFromPartNumbers $subscribedSkus $skuMap.EligibleBaseSkuPartNumbers
-$copilotSkuIds = Resolve-SkuIdsFromPartNumbers $subscribedSkus $skuMap.CopilotSkuPartNumbers
+  $eligibleBaseSkuIds = Resolve-SkuIdsFromPartNumbers $subscribedSkus $skuMap.EligibleBaseSkuPartNumbers
+  $copilotSkuIds = Resolve-SkuIdsFromPartNumbers $subscribedSkus $skuMap.CopilotSkuPartNumbers
 }
 
 $users = @()
-$errors += Try-Run "Get-Users" {
-$users = Get-MgUser -All -Property Id,DisplayName,UserPrincipalName,AccountEnabled,UserType
-}
-
+$errors += Try-Run "Get-Users" { $users = Get-MgUser -All -Property Id,DisplayName,UserPrincipalName,AccountEnabled,UserType }
 if($PilotUsersUpn.Count -gt 0){ $users = $users | Where-Object { $PilotUsersUpn -contains $_.UserPrincipalName } }
 
 $userRows = @()
 $errors += Try-Run "Get-UserLicenseDetail" {
-foreach($u in $users){
-$licenseDetail = Get-MgUserLicenseDetail -UserId $u.Id -ErrorAction Stop
-$userSkuIds = @($licenseDetail | Select-Object -ExpandProperty SkuId)
-$hasEligibleBase = if($skuMap){ Test-UserHasAnySkuId $userSkuIds $eligibleBaseSkuIds } else { $null }
-$hasCopilot = if($skuMap){ Test-UserHasAnySkuId $userSkuIds $copilotSkuIds } else { $null }
-
-$userRows += [pscustomobject]@{
-SnapshotId=$snapshotId;
-UserPrincipalName=$u.UserPrincipalName;
-DisplayName=$u.DisplayName;
-AccountEnabled=$u.AccountEnabled;
-UserType=$u.UserType;
-AssignedSkuPartNumbers=($licenseDetail.SkuPartNumber -join "|");
-HasEligibleBaseSku= if($skuMap){ [bool]$hasEligibleBase } else { "Unknown" };
-HasCopilotAddOn= if($skuMap){ [bool]$hasCopilot } else { "Unknown" }
-}
-}
+  foreach($u in $users){
+    $licenseDetail = Get-MgUserLicenseDetail -UserId $u.Id -ErrorAction Stop
+    $userSkuIds = @($licenseDetail | Select-Object -ExpandProperty SkuId)
+    $hasEligibleBase = if($skuMap){ Test-UserHasAnySkuId $userSkuIds $eligibleBaseSkuIds } else { $null }
+    $hasCopilot = if($skuMap){ Test-UserHasAnySkuId $userSkuIds $copilotSkuIds } else { $null }
+    $userRows += [pscustomobject]@{
+      SnapshotId=$snapshotId; UserPrincipalName=$u.UserPrincipalName; DisplayName=$u.DisplayName; AccountEnabled=$u.AccountEnabled; UserType=$u.UserType;
+      AssignedSkuPartNumbers=($licenseDetail.SkuPartNumber -join "|");
+      HasEligibleBaseSku= if($skuMap){ [bool]$hasEligibleBase } else { "Unknown" };
+      HasCopilotAddOn= if($skuMap){ [bool]$hasCopilot } else { "Unknown" }
+    }
+  }
 }
 Write-Csv $userRows (Join-Path $OutputPath "Users_Licensing.csv")
 
 # -------------------------------
 # 3) Conditional Access policies
 # -------------------------------
-$ca = @()
-$errors += Try-Run "Get-ConditionalAccess" { $ca = Get-MgIdentityConditionalAccessPolicy -All }
+$ca = @(); $errors += Try-Run "Get-ConditionalAccess" { $ca = Get-MgIdentityConditionalAccessPolicy -All }
 $caRows = foreach($p in $ca){ [pscustomobject]@{ SnapshotId=$snapshotId; PolicyId=$p.Id; Name=$p.DisplayName; State=$p.State; Created=$p.CreatedDateTime; Modified=$p.ModifiedDateTime } }
 Write-Csv $caRows (Join-Path $OutputPath "Entra_ConditionalAccess.csv")
 
 # -------------------------------
-# 4) Directory role assignments (admin hygiene signal)
+# 4) Directory role assignments
 # -------------------------------
 $roles = @(); $errors += Try-Run "Get-DirectoryRoles" { $roles = Get-MgDirectoryRole -All }
-$roleAssignments = @()
+$roleAssignments = @();
 $errors += Try-Run "Get-RoleAssignments" {
-foreach($r in $roles){
-$members = Get-MgDirectoryRoleMember -DirectoryRoleId $r.Id -All
-foreach($m in $members){
-$roleAssignments += [pscustomobject]@{ SnapshotId=$snapshotId; RoleName=$r.DisplayName; AssigneeId=$m.Id; AssigneeType=$m.AdditionalProperties["@odata.type"] }
-}
-}
-}
-Write-Csv $roleAssignments (Join-Path $OutputPath "Entra_Roles.csv")
-
-# -------------------------------
-# 5) Teams + Groups posture (public/private, ownership)
-# -------------------------------
-$groupRows = @()
-$errors += Try-Run "Get-Groups" {
-$groups = Get-MgGroup -All -Property Id,DisplayName,Visibility,GroupTypes,ResourceProvisioningOptions,CreatedDateTime
-foreach($g in $groups){
-$isM365Group = ($g.GroupTypes -contains "Unified")
-$hasTeam = ($g.ResourceProvisioningOptions -contains "Team")
-if($isM365Group -or $hasTeam){
-$owners = Get-MgGroupOwner -GroupId $g.Id -All
-$members = Get-MgGroupMember -GroupId $g.Id -All
-$groupRows += [pscustomobject]@{ SnapshotId=$snapshotId; GroupId=$g.Id; DisplayName=$g.DisplayName; Visibility=$g.Visibility; HasTeam=$hasTeam; OwnersCount=($owners|Measure-Object).Count; MembersCount=($members|Measure-Object).Count; CreatedDateTime=$g.CreatedDateTime }
-}
-}
-}
-Write-Csv $groupRows (Join-Path $OutputPath "Teams_Groups.csv")
-
-# -------------------------------
-# 6) SharePoint Online tenant sharing settings (SPO Management Shell)
-# -------------------------------
-$spoRow = @()
-if(-not $SkipSharePoint){
-$errors += Try-Run "Get-SPOTenant" {
-Import-Module Microsoft.Online.SharePoint.PowerShell -ErrorAction Stop
-$adminUrl = if([string]::IsNullOrWhiteSpace($PnPTenantAdminUrl)){ "https://" + ($TenantDomain.Split('.')[0]) + "-admin.sharepoint.com" } else { $PnPTenantAdminUrl }
-Connect-SPOService -Url $adminUrl
-$tenant = Get-SPOTenant
-$spoRow = [pscustomobject]@{ SnapshotId=$snapshotId; SharingCapability=$tenant.SharingCapability; DefaultSharingLinkType=$tenant.DefaultSharingLinkType; DefaultLinkPermission=$tenant.DefaultLinkPermission; RequireAcceptingAccountMatchInvitedAccount=$tenant.RequireAcceptingAccountMatchInvitedAccount; AllowedDomainList=($tenant.AllowedDomainList -join ";"); BlockedDomainList=($tenant.BlockedDomainList -join ";") }
-}
-if($spoRow){ Write-Csv @($spoRow) (Join-Path $OutputPath "SharePoint_TenantSharing.csv") }
-}
-
-# -------------------------------
-# 7) SharePoint sharing link inventory (PnP.PowerShell) — top sites first
-# -------------------------------
-if($IncludeSharingLinks -and -not $SkipSharePoint){
-$errors += Try-Run "PnP-SharingLinks" {
-Import-Module PnP.PowerShell -ErrorAction Stop
-$adminUrl = if([string]::IsNullOrWhiteSpace($PnPTenantAdminUrl)){ "https://" + ($TenantDomain.Split('.')[0]) + "-admin.sharepoint.com" } else { $PnPTenantAdminUrl }
-Connect-PnPOnline -Url $adminUrl -Interactive
-
-$sites = Get-PnPTenantSite -IncludeOneDriveSites:$false -Detailed -ErrorAction Stop | Where-Object { $_.Url -like "https://*sharepoint.com/sites/*" }
-$sites = $sites | Sort-Object -Property StorageUsageCurrent -Descending | Select-Object -First $TopSites
-
-$linkRows = @()
-foreach($s in $sites){
-Connect-PnPOnline -Url $s.Url -Interactive
-$lists = Get-PnPList | Where-Object { $_.BaseTemplate -eq 101 -and $_.Hidden -eq $false }
-foreach($list in $lists){
-$items = Get-PnPListItem -List $list -PageSize 500 -Fields "FileRef","FileLeafRef" -ErrorAction SilentlyContinue
-foreach($it in $items){
-$ref = $it.FieldValues["FileRef"]
-if([string]::IsNullOrWhiteSpace($ref)){ continue }
-$sharingLinks = Get-PnPFileSharingLink -Identity $ref -ErrorAction SilentlyContinue
-foreach($sl in $sharingLinks){
-$linkRows += [pscustomobject]@{
-SnapshotId=$snapshotId;
-SiteUrl=$s.Url;
-ListTitle=$list.Title;
-Name=$it.FieldValues["FileLeafRef"];
-RelativeUrl=$ref;
-ShareLinkUrl=$sl.Link.WebUrl;
-ShareLinkType=$sl.Link.Type;
-ShareLinkScope=$sl.Link.Scope;
-Expiration=$sl.ExpirationDateTime;
-RequiresPassword=$sl.HasPassword
-}
-}
-}
-}
-}
-Write-Csv $linkRows (Join-Path $OutputPath "SharePoint_SharingLinks_TopSites.csv")
-}
-}
-
-# -------------------------------
-# 8) MFA method coverage (Graph) — per-user registered methods
-# -------------------------------
-if($IncludeMfaMethods){
-$errors += Try-Run "MFA-Methods" {
-Import-Module Microsoft.Graph.Identity.SignIns -ErrorAction Stop
-$mfaRows = @()
-foreach($u in $users){
-# Note: This reports registered methods, not whether a CA policy enforces MFA at sign-in.
-$methods = Get-MgUserAuthenticationMethod -UserId $u.Id -All -ErrorAction SilentlyContinue
-$methodTypes = @($methods | ForEach-Object { $_.AdditionalProperties["@odata.type"] })
-$nonPassword = $methodTypes | Where-Object { $_ -and $_ -notmatch "passwordAuthenticationMethod" }
-$mfaEnabled = ($nonPassword.Count -gt 0)
-$mfaRows += [pscustomobject]@{
-SnapshotId=$snapshotId;
-UserPrincipalName=$u.UserPrincipalName;
-DisplayName=$u.DisplayName;
-AuthMethodTypes=($methodTypes -join "|");
-StrongAuthRegistered=$mfaEnabled;
-AuthMethodsCount=$methodTypes.Count
-}
-}
-Write-Csv $mfaRows (Join-Path $OutputPath "Entra_MFA_Methods.csv")
-}
-}
-
-# -------------------------------
-# 9) Exchange Online mailbox prerequisite (basic inventory)
-# -------------------------------
-if(-not $SkipExchange){
-$errors += Try-Run "ExchangeOnline" {
-Import-Module ExchangeOnlineManagement -ErrorAction Stop
-Connect-ExchangeOnline -ShowBanner:$false
-$mbx = Get-EXOMailbox -ResultSize Unlimited -Properties DisplayName,UserPrincipalName,RecipientTypeDetails,IsMailboxEnabled
-$mbxRows = $mbx | Select-Object @{n="SnapshotId";e={$snapshotId}},DisplayName,UserPrincipalName,RecipientTypeDetails,IsMailboxEnabled
-Write-Csv $mbxRows (Join-Path $OutputPath "Exchange_Mailboxes.csv")
-Disconnect-ExchangeOnline -Confirm:$false
-}
-}
-
-# -------------------------------
-# 10) Purview: sensitivity labels + label policies + DLP policies (S&C PowerShell)
-# -------------------------------
-if($IncludePurview){
-$errors += Try-Run "Purview-Connect" {
-Import-Module ExchangeOnlineManagement -ErrorAction Stop
-Connect-IPPSSession | Out-Null
-}
-
-$errors += Try-Run "Purview-Labels" {
-$labels = Get-Label -ErrorAction Stop
-$labelRows = foreach($l in $labels){
-[pscustomobject]@{ SnapshotId=$snapshotId; LabelId=$l.ImmutableId; LabelName=$l.DisplayName; Enabled=$l.Disabled -ne $true; Priority=$l.Priority; ContentType=$l.ContentType }
-}
-Write-Csv $labelRows (Join-Path $OutputPath "Purview_Labels.csv")
-}
-
-$errors += Try-Run "Purview-LabelPolicies" {
-$policies = Get-LabelPolicy -ErrorAction Stop
-$policyRows = foreach($p in $policies){
-[pscustomobject]@{ SnapshotId=$snapshotId; PolicyName=$p.DisplayName; Mode=$p.Mode; DistributionStatus=$p.DistributionStatus; Locations=($p.ExchangeLocation -join "|") }
-}
-Write-Csv $policyRows (Join-Path $OutputPath "Purview_LabelPolicies.csv")
-}
-
-$errors += Try-Run "Purview-DlpPolicies" {
-# DLP cmdlets exist in S&C session; availability varies by tenant/licensing.
-$dlp = Get-DlpCompliancePolicy -ErrorAction Stop
-$dlpRows = foreach($d in $dlp){
-[pscustomobject]@{ SnapshotId=$snapshotId; PolicyName=$d.Name; Mode=$d.Mode; Workload=$d.Workload; Enabled=$d.Enabled }
-}
-Write-Csv $dlpRows (Join-Path $OutputPath "Purview_DlpPolicies.csv")
-}
-}
-
-# -------------------------------
-# 11) Compute simple scores (placeholder logic)
-# -------------------------------
-$scores = @(
-[pscustomobject]@{SnapshotId=$snapshotId;Domain="Licensing & prerequisites";Score=0;Priority="P0";Notes= if($skuMap){"Computed via sku-map.json"} else {"No SKU map provided"}},
-[pscustomobject]@{SnapshotId=$snapshotId;Domain="Identity & access";Score=0;Priority="P0";Notes= if($IncludeMfaMethods){"Includes registered MFA methods export"} else {"No MFA method export"}},
-[pscustomobject]@{SnapshotId=$snapshotId;Domain="Endpoint & network";Score=0;Priority="P1";Notes="Populate after device/apps inventory"},
-[pscustomobject]@{SnapshotId=$snapshotId;Domain="Data governance & permissions";Score=0;Priority="P0";Notes= if($IncludeSharingLinks){"Includes top-site sharing links inventory"} else {"No sharing links inventory"}},
-[pscustomobject]@{SnapshotId=$snapshotId;Domain="Purview protection & compliance";Score=0;Priority="P0";Notes= if($IncludePurview){"Includes labels/policies/DLP exports"} else {"No Purview exports"}},
-[pscustomobject]@{SnapshotId=$snapshotId;Domain="Security monitoring & operations";Score=0;Priority="P1";Notes="Populate after ops review"}
-)
-Write-Csv $scores (Join-Path $OutputPath "Summary_Scores.csv")
-
-# -------------------------------
-# 12) Export errors (if any) for transparency
-# -------------------------------
-if($errors | Where-Object { $_ -ne $null }){ Write-Csv ($errors | Where-Object { $_ -ne $null }) (Join-Path $OutputPath "Run_Errors.csv") }
-
-Write-Host "Done. SnapshotId: $snapshotId"
