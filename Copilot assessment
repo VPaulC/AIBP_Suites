@@ -16,13 +16,17 @@ param(
   [Parameter(Mandatory = $false)][switch]$SkipSharePoint,
   [Parameter(Mandatory = $false)][int]$RetryCount = 3,
   [Parameter(Mandatory = $false)][int]$RetryDelaySeconds = 3,
-  [Parameter(Mandatory = $false)][string]$LogLevel = "Info"
+  [Parameter(Mandatory = $false)][string]$LogLevel = "Info",
+  [Parameter(Mandatory = $false)][bool]$AutoInstallMissingModules = $true,
+  [Parameter(Mandatory = $false)][string]$InstallScope = "CurrentUser",
+  [Parameter(Mandatory = $false)][switch]$TrustPSGallery,
+  [Parameter(Mandatory = $false)][switch]$UseDeviceAuthentication
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
-$script:ScriptVersion = "1.0"
+$script:ScriptVersion = "1.1"
 $script:SnapshotId = [guid]::NewGuid().ToString()
 $script:RunDateUtc = (Get-Date).ToUniversalTime().ToString("o")
 $script:Errors = [System.Collections.Generic.List[object]]::new()
@@ -191,6 +195,64 @@ function Invoke-Step {
   }
 }
 
+function Ensure-PackageManagement {
+  try {
+    if (-not (Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue)) {
+      Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null
+    }
+
+    if ($TrustPSGallery) {
+      $gallery = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
+      if ($gallery -and $gallery.InstallationPolicy -ne 'Trusted') {
+        Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+      }
+    }
+  }
+  catch {
+    throw "Failed to initialise package management: $($_.Exception.Message)"
+  }
+}
+
+function Ensure-Module {
+  param(
+    [Parameter(Mandatory)][string]$Name,
+    [string]$MinimumVersion = '',
+    [switch]$AllowClobber
+  )
+
+  $loaded = Get-Module -ListAvailable -Name $Name | Sort-Object Version -Descending | Select-Object -First 1
+  $needsInstall = $false
+
+  if (-not $loaded) {
+    $needsInstall = $true
+  }
+  elseif ($MinimumVersion) {
+    try {
+      if ([version]$loaded.Version -lt [version]$MinimumVersion) {
+        $needsInstall = $true
+      }
+    }
+    catch {
+      $needsInstall = $true
+    }
+  }
+
+  if ($needsInstall) {
+    if (-not $AutoInstallMissingModules) {
+      throw "Required module '$Name' is missing or below minimum version '$MinimumVersion'."
+    }
+
+    $installParams = @{ Name = $Name; Scope = $InstallScope; Force = $true; ErrorAction = 'Stop' }
+    if ($AllowClobber) { $installParams['AllowClobber'] = $true }
+    if ($MinimumVersion) { $installParams['MinimumVersion'] = $MinimumVersion }
+
+    Write-Log -Level Info -Step 'Bootstrap-Modules' -Message ("Installing module {0}" -f $Name)
+    Install-Module @installParams | Out-Null
+  }
+
+  Import-Module $Name -ErrorAction Stop -Force
+}
+
 function Read-SkuMap {
   param([Parameter(Mandatory)][string]$Path)
   if (Test-Path -LiteralPath $Path) {
@@ -217,10 +279,7 @@ function Resolve-SkuIdsFromPartNumbers {
 }
 
 function Test-UserHasAnySkuId {
-  param(
-    $UserSkuIds,
-    $WantedSkuIds
-  )
+  param($UserSkuIds, $WantedSkuIds)
   foreach ($id in @($WantedSkuIds)) {
     if (@($UserSkuIds) -contains $id) { return $true }
   }
@@ -252,6 +311,18 @@ function Disconnect-Safely {
   }
 }
 
+function Connect-GraphSafe {
+  param([string[]]$Scopes)
+
+  $uniqueScopes = @($Scopes | Where-Object { $_ } | Select-Object -Unique)
+  if ($UseDeviceAuthentication) {
+    Connect-MgGraph -Scopes $uniqueScopes -NoWelcome -UseDeviceAuthentication | Out-Null
+  }
+  else {
+    Connect-MgGraph -Scopes $uniqueScopes -NoWelcome | Out-Null
+  }
+}
+
 # -------------------------------
 # Initialisation
 # -------------------------------
@@ -264,13 +335,36 @@ $tenantId = $null
 $subscribedSkus = @()
 $users = @()
 $skuMap = $null
+$spoAdminUrl = $null
+$needsExchange = (-not $SkipExchange) -or $IncludePurview -or $IncludeDataClassification
+$needsSPO = -not $SkipSharePoint
+$needsPnP = $IncludeSharingLinks -and (-not $SkipSharePoint)
 
 try {
+  # -------------------------------
+  # 0) Bootstrap modules + upfront connections
+  # -------------------------------
+  Invoke-Step -Name 'Bootstrap-Modules' -ScriptBlock {
+    Ensure-PackageManagement
+    Ensure-Module -Name 'Microsoft.Graph' -MinimumVersion '2.0.0' -AllowClobber
+    if ($IncludeMfaMethods) {
+      Ensure-Module -Name 'Microsoft.Graph.Identity.SignIns' -MinimumVersion '2.0.0' -AllowClobber
+    }
+    if ($needsExchange) {
+      Ensure-Module -Name 'ExchangeOnlineManagement' -MinimumVersion '3.0.0' -AllowClobber
+    }
+    if ($needsSPO) {
+      Ensure-Module -Name 'Microsoft.Online.SharePoint.PowerShell' -AllowClobber
+    }
+    if ($needsPnP) {
+      Ensure-Module -Name 'PnP.PowerShell' -MinimumVersion '2.3.0' -AllowClobber
+    }
+  }
+
   # -------------------------------
   # 1) Microsoft Graph (core)
   # -------------------------------
   Invoke-Step -Name 'Connect-MgGraph' -ScriptBlock {
-    Import-Module Microsoft.Graph -ErrorAction Stop
     $scopes = @(
       'Organization.Read.All',
       'User.Read.All',
@@ -280,7 +374,7 @@ try {
       'LicenseAssignment.Read.All'
     )
     if ($IncludeMfaMethods) { $scopes += 'UserAuthenticationMethod.Read.All' }
-    Connect-MgGraph -Scopes ($scopes | Select-Object -Unique) -NoWelcome | Out-Null
+    Connect-GraphSafe -Scopes $scopes
   }
 
   $org = Invoke-Step -Name 'Get-Org' -ScriptBlock {
@@ -294,9 +388,53 @@ try {
     $defaultDomain = $org.VerifiedDomains | Where-Object { $_.IsDefault -eq $true } | Select-Object -First 1
     if ($defaultDomain -and $defaultDomain.Name) {
       $TenantDomain = $defaultDomain.Name
-    } else {
+    }
+    else {
       throw 'TenantDomain was not supplied and no default verified domain was returned by Graph.'
     }
+  }
+
+  if ($needsSPO -or $needsPnP) {
+    $spoAdminUrl = if ([string]::IsNullOrWhiteSpace($PnPTenantAdminUrl)) {
+      'https://' + ($TenantDomain.Split('.')[0]) + '-admin.sharepoint.com'
+    }
+    else {
+      $PnPTenantAdminUrl
+    }
+  }
+
+  if ($needsSPO) {
+    Invoke-Step -Name 'Connect-SPOService' -ScriptBlock {
+      Connect-SPOService -Url $spoAdminUrl
+    } -ContinueOnError
+  }
+
+  if ($needsPnP) {
+    Invoke-Step -Name 'Connect-PnPAdmin' -ScriptBlock {
+      if ($UseDeviceAuthentication) {
+        Connect-PnPOnline -Url $spoAdminUrl -DeviceLogin
+      }
+      else {
+        Connect-PnPOnline -Url $spoAdminUrl -Interactive
+      }
+    } -ContinueOnError
+  }
+
+  if ($needsExchange) {
+    Invoke-Step -Name 'Connect-ExchangeOnline' -ScriptBlock {
+      if ($UseDeviceAuthentication) {
+        Connect-ExchangeOnline -ShowBanner:$false -Device
+      }
+      else {
+        Connect-ExchangeOnline -ShowBanner:$false
+      }
+    } -ContinueOnError
+  }
+
+  if ($IncludePurview -or $IncludeDataClassification) {
+    Invoke-Step -Name 'Connect-IPPSSession' -ScriptBlock {
+      Connect-IPPSSession | Out-Null
+    } -ContinueOnError
   }
 
   $snapshot = [pscustomobject]@{
@@ -346,14 +484,14 @@ try {
 
     if ($null -eq $licenseDetail) {
       $userRows.Add([pscustomobject]@{
-        SnapshotId            = $script:SnapshotId
-        UserPrincipalName     = $u.UserPrincipalName
-        DisplayName           = $u.DisplayName
-        AccountEnabled        = $u.AccountEnabled
-        UserType              = $u.UserType
-        AssignedSkuPartNumbers= ''
-        HasEligibleBaseSku    = if ($skuMap) { $false } else { 'Unknown' }
-        HasCopilotAddOn       = if ($skuMap) { $false } else { 'Unknown' }
+        SnapshotId             = $script:SnapshotId
+        UserPrincipalName      = $u.UserPrincipalName
+        DisplayName            = $u.DisplayName
+        AccountEnabled         = $u.AccountEnabled
+        UserType               = $u.UserType
+        AssignedSkuPartNumbers = ''
+        HasEligibleBaseSku     = if ($skuMap) { $false } else { 'Unknown' }
+        HasCopilotAddOn        = if ($skuMap) { $false } else { 'Unknown' }
       })
       continue
     }
@@ -463,23 +601,15 @@ try {
   # -------------------------------
   if (-not $SkipSharePoint) {
     $spoRow = Invoke-Step -Name 'Get-SPOTenant' -ScriptBlock {
-      Import-Module Microsoft.Online.SharePoint.PowerShell -ErrorAction Stop
-      if (-not $TenantDomain) { throw 'TenantDomain could not be determined.' }
-      $adminUrl = if ([string]::IsNullOrWhiteSpace($PnPTenantAdminUrl)) {
-        'https://' + ($TenantDomain.Split('.')[0]) + '-admin.sharepoint.com'
-      } else {
-        $PnPTenantAdminUrl
-      }
-      Connect-SPOService -Url $adminUrl
       $tenant = Get-SPOTenant
       [pscustomobject]@{
-        SnapshotId                                   = $script:SnapshotId
-        SharingCapability                            = $tenant.SharingCapability
-        DefaultSharingLinkType                       = $tenant.DefaultSharingLinkType
-        DefaultLinkPermission                        = $tenant.DefaultLinkPermission
-        RequireAcceptingAccountMatchInvitedAccount   = $tenant.RequireAcceptingAccountMatchInvitedAccount
-        AllowedDomainList                            = (@($tenant.AllowedDomainList) -join ';')
-        BlockedDomainList                            = (@($tenant.BlockedDomainList) -join ';')
+        SnapshotId                                 = $script:SnapshotId
+        SharingCapability                          = $tenant.SharingCapability
+        DefaultSharingLinkType                     = $tenant.DefaultSharingLinkType
+        DefaultLinkPermission                      = $tenant.DefaultLinkPermission
+        RequireAcceptingAccountMatchInvitedAccount = $tenant.RequireAcceptingAccountMatchInvitedAccount
+        AllowedDomainList                          = (@($tenant.AllowedDomainList) -join ';')
+        BlockedDomainList                          = (@($tenant.BlockedDomainList) -join ';')
       }
     } -ContinueOnError
 
@@ -493,14 +623,6 @@ try {
   # -------------------------------
   if ($IncludeSharingLinks -and -not $SkipSharePoint) {
     Invoke-Step -Name 'PnP-SharingLinks' -ScriptBlock {
-      Import-Module PnP.PowerShell -ErrorAction Stop
-      $adminUrl = if ([string]::IsNullOrWhiteSpace($PnPTenantAdminUrl)) {
-        'https://' + ($TenantDomain.Split('.')[0]) + '-admin.sharepoint.com'
-      } else {
-        $PnPTenantAdminUrl
-      }
-
-      Connect-PnPOnline -Url $adminUrl -Interactive
       $sites = Get-PnPTenantSite -IncludeOneDriveSites:$false -Detailed -ErrorAction Stop |
         Where-Object { $_.Url -like 'https://*sharepoint.com/sites/*' } |
         Sort-Object -Property StorageUsageCurrent -Descending |
@@ -508,7 +630,13 @@ try {
 
       $linkRows = New-Object System.Collections.Generic.List[object]
       foreach ($s in @($sites)) {
-        Connect-PnPOnline -Url $s.Url -Interactive
+        if ($UseDeviceAuthentication) {
+          Connect-PnPOnline -Url $s.Url -DeviceLogin
+        }
+        else {
+          Connect-PnPOnline -Url $s.Url -Interactive
+        }
+
         $lists = Get-PnPList | Where-Object { $_.BaseTemplate -eq 101 -and $_.Hidden -eq $false }
         foreach ($list in @($lists)) {
           $items = Get-PnPListItem -List $list -PageSize 500 -Fields 'FileRef','FileLeafRef' -ErrorAction SilentlyContinue
@@ -534,6 +662,13 @@ try {
         }
       }
       Write-CsvSafe -Object $linkRows -Path (Join-Path $OutputPath 'SharePoint_SharingLinks_TopSites.csv')
+
+      if ($UseDeviceAuthentication) {
+        Connect-PnPOnline -Url $spoAdminUrl -DeviceLogin
+      }
+      else {
+        Connect-PnPOnline -Url $spoAdminUrl -Interactive
+      }
     } -ContinueOnError
   }
 
@@ -542,7 +677,6 @@ try {
   # -------------------------------
   if ($IncludeMfaMethods) {
     Invoke-Step -Name 'MFA-Methods' -ScriptBlock {
-      Import-Module Microsoft.Graph.Identity.SignIns -ErrorAction Stop
       $mfaRows = New-Object System.Collections.Generic.List[object]
       foreach ($u in @($users)) {
         $methods = Invoke-WithRetry -Name ("Get-MgUserAuthenticationMethod:{0}" -f $u.UserPrincipalName) -ScriptBlock {
@@ -553,12 +687,12 @@ try {
         $nonPassword = @($methodTypes | Where-Object { $_ -and $_ -notmatch 'passwordAuthenticationMethod' })
 
         $mfaRows.Add([pscustomobject]@{
-          SnapshotId         = $script:SnapshotId
-          UserPrincipalName  = $u.UserPrincipalName
-          DisplayName        = $u.DisplayName
-          AuthMethodTypes    = ($methodTypes -join '|')
+          SnapshotId           = $script:SnapshotId
+          UserPrincipalName    = $u.UserPrincipalName
+          DisplayName          = $u.DisplayName
+          AuthMethodTypes      = ($methodTypes -join '|')
           StrongAuthRegistered = ($nonPassword.Count -gt 0)
-          AuthMethodsCount   = $methodTypes.Count
+          AuthMethodsCount     = $methodTypes.Count
         })
       }
       Write-CsvSafe -Object $mfaRows -Path (Join-Path $OutputPath 'Entra_MFA_Methods.csv')
@@ -569,9 +703,7 @@ try {
   # 9) Exchange Online mailbox inventory
   # -------------------------------
   if (-not $SkipExchange) {
-    Invoke-Step -Name 'ExchangeOnline' -ScriptBlock {
-      Import-Module ExchangeOnlineManagement -ErrorAction Stop
-      Connect-ExchangeOnline -ShowBanner:$false
+    Invoke-Step -Name 'Exchange-Mailboxes' -ScriptBlock {
       $mbx = Get-EXOMailbox -ResultSize Unlimited -Properties DisplayName,UserPrincipalName,RecipientTypeDetails,IsMailboxEnabled
       $mbxRows = $mbx | Select-Object @{n='SnapshotId';e={$script:SnapshotId}}, DisplayName, UserPrincipalName, RecipientTypeDetails, IsMailboxEnabled
       Write-CsvSafe -Object $mbxRows -Path (Join-Path $OutputPath 'Exchange_Mailboxes.csv')
@@ -581,24 +713,17 @@ try {
   # -------------------------------
   # 10) Purview: labels + label policies + DLP policies (S&C PowerShell)
   # -------------------------------
-  if ($IncludePurview -or $IncludeDataClassification) {
-    Invoke-Step -Name 'Purview-Connect' -ScriptBlock {
-      Import-Module ExchangeOnlineManagement -ErrorAction Stop
-      Connect-IPPSSession | Out-Null
-    } -ContinueOnError
-  }
-
   if ($IncludePurview) {
     Invoke-Step -Name 'Purview-Labels' -ScriptBlock {
       $labels = Get-Label -ErrorAction Stop
       $labelRows = foreach ($l in @($labels)) {
         [pscustomobject]@{
-          SnapshotId = $script:SnapshotId
-          LabelId    = $l.ImmutableId
-          LabelName  = $l.DisplayName
-          Enabled    = $l.Disabled -ne $true
-          Priority   = $l.Priority
-          ContentType= $l.ContentType
+          SnapshotId  = $script:SnapshotId
+          LabelId     = $l.ImmutableId
+          LabelName   = $l.DisplayName
+          Enabled     = $l.Disabled -ne $true
+          Priority    = $l.Priority
+          ContentType = $l.ContentType
         }
       }
       Write-CsvSafe -Object $labelRows -Path (Join-Path $OutputPath 'Purview_Labels.csv')
@@ -641,11 +766,11 @@ try {
       $sits = Get-DlpSensitiveInformationType -ErrorAction Stop
       $sitRows = foreach ($s in @($sits)) {
         [pscustomobject]@{
-          SnapshotId             = $script:SnapshotId
-          Name                   = $s.Name
-          Id                     = $s.Id
-          Publisher              = $s.Publisher
-          RecommendedConfidence  = $s.RecommendedConfidence
+          SnapshotId            = $script:SnapshotId
+          Name                  = $s.Name
+          Id                    = $s.Id
+          Publisher             = $s.Publisher
+          RecommendedConfidence = $s.RecommendedConfidence
         }
       }
       Write-CsvSafe -Object $sitRows -Path (Join-Path $OutputPath 'Purview_SITs.csv')
@@ -696,10 +821,10 @@ try {
         $matches = [regex]::Matches($json, '"Name"\s*:\s*"([^"]+)"\s*,\s*"ClassifierType"\s*:\s*"MLModel"')
         foreach ($m in $matches) {
           $usage.Add([pscustomobject]@{
-            SnapshotId    = $script:SnapshotId
-            PolicyType    = 'AutoLabel'
-            RuleName      = $r.Name
-            ClassifierName= $m.Groups[1].Value
+            SnapshotId     = $script:SnapshotId
+            PolicyType     = 'AutoLabel'
+            RuleName       = $r.Name
+            ClassifierName = $m.Groups[1].Value
           })
         }
       }
@@ -713,10 +838,10 @@ try {
         $matches = [regex]::Matches($json, '"Name"\s*:\s*"([^"]+)"\s*,\s*"ClassifierType"\s*:\s*"MLModel"')
         foreach ($m in $matches) {
           $usage.Add([pscustomobject]@{
-            SnapshotId    = $script:SnapshotId
-            PolicyType    = 'DLP'
-            RuleName      = $r.Name
-            ClassifierName= $m.Groups[1].Value
+            SnapshotId     = $script:SnapshotId
+            PolicyType     = 'DLP'
+            RuleName       = $r.Name
+            ClassifierName = $m.Groups[1].Value
           })
         }
       }
