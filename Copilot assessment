@@ -26,7 +26,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
-$script:ScriptVersion = "1.1"
+
+$script:ScriptVersion = "1.2"
 $script:SnapshotId = [guid]::NewGuid().ToString()
 $script:RunDateUtc = (Get-Date).ToUniversalTime().ToString("o")
 $script:Errors = [System.Collections.Generic.List[object]]::new()
@@ -37,8 +38,6 @@ $script:LogFile = $null
 # -------------------------------
 # Utility / logging helpers
 # -------------------------------
-function New-SnapshotId { return ([Guid]::NewGuid()).ToString() }
-
 function Ensure-Folder {
   param([Parameter(Mandatory)][string]$Path)
   if (-not (Test-Path -LiteralPath $Path)) {
@@ -96,7 +95,8 @@ function Add-RunIssue {
 
   if ($Type -eq 'Error') {
     $script:Errors.Add($record)
-  } else {
+  }
+  else {
     $script:Warnings.Add($record)
   }
 }
@@ -141,8 +141,7 @@ function Invoke-WithRetry {
     }
     catch {
       $lastError = $_
-      $msg = $_.Exception.Message
-      Write-Log -Level Warn -Step $Name -Message ("Attempt {0} failed: {1}" -f $attempt, $msg)
+      Write-Log -Level Warn -Step $Name -Message ("Attempt {0} failed: {1}" -f $attempt, $_.Exception.Message)
 
       if ($attempt -lt $MaxAttempts) {
         Write-Log -Level Info -Step $Name -Message ("Retrying in {0} seconds" -f $delay)
@@ -152,7 +151,7 @@ function Invoke-WithRetry {
     }
   }
 
-  $detail = if ($lastError) { $lastError | Out-String } else { '' }
+  $detail = if ($lastError) { $lastError | Out-String } else { "" }
   Add-RunIssue -Type Error -Step $Name -Message ("Failed after {0} attempts" -f $MaxAttempts) -Detail $detail
 
   if (-not $NonTerminating) {
@@ -169,10 +168,11 @@ function Invoke-Step {
     [switch]$ContinueOnError
   )
 
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
   try {
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $result = Invoke-WithRetry -Name $Name -ScriptBlock $ScriptBlock -MaxAttempts $RetryCount -InitialDelaySeconds $RetryDelaySeconds -NonTerminating:$ContinueOnError
     $sw.Stop()
+
     $script:Summary.Add([pscustomobject]@{
       SnapshotId      = $script:SnapshotId
       RunDateUtc      = $script:RunDateUtc
@@ -180,6 +180,7 @@ function Invoke-Step {
       Status          = if ($null -eq $result -and $ContinueOnError) { 'CompletedWithNoResult' } else { 'Success' }
       DurationSeconds = [math]::Round($sw.Elapsed.TotalSeconds, 2)
     })
+
     return $result
   }
   catch {
@@ -195,6 +196,9 @@ function Invoke-Step {
   }
 }
 
+# -------------------------------
+# Bootstrap / module helpers
+# -------------------------------
 function Ensure-PackageManagement {
   try {
     if (-not (Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue)) {
@@ -220,15 +224,15 @@ function Ensure-Module {
     [switch]$AllowClobber
   )
 
-  $loaded = Get-Module -ListAvailable -Name $Name | Sort-Object Version -Descending | Select-Object -First 1
+  $installed = Get-Module -ListAvailable -Name $Name | Sort-Object Version -Descending | Select-Object -First 1
   $needsInstall = $false
 
-  if (-not $loaded) {
+  if (-not $installed) {
     $needsInstall = $true
   }
   elseif ($MinimumVersion) {
     try {
-      if ([version]$loaded.Version -lt [version]$MinimumVersion) {
+      if ([version]$installed.Version -lt [version]$MinimumVersion) {
         $needsInstall = $true
       }
     }
@@ -242,7 +246,12 @@ function Ensure-Module {
       throw "Required module '$Name' is missing or below minimum version '$MinimumVersion'."
     }
 
-    $installParams = @{ Name = $Name; Scope = $InstallScope; Force = $true; ErrorAction = 'Stop' }
+    $installParams = @{
+      Name        = $Name
+      Scope       = $InstallScope
+      Force       = $true
+      ErrorAction = 'Stop'
+    }
     if ($AllowClobber) { $installParams['AllowClobber'] = $true }
     if ($MinimumVersion) { $installParams['MinimumVersion'] = $MinimumVersion }
 
@@ -251,64 +260,6 @@ function Ensure-Module {
   }
 
   Import-Module $Name -ErrorAction Stop -Force
-}
-
-function Read-SkuMap {
-  param([Parameter(Mandatory)][string]$Path)
-  if (Test-Path -LiteralPath $Path) {
-    return (Get-Content -Raw -Path $Path | ConvertFrom-Json -ErrorAction Stop)
-  }
-  Write-Log -Level Warn -Step 'Read-SkuMap' -Message ("SKU map file not found: {0}" -f $Path)
-  Add-RunIssue -Type Warning -Step 'Read-SkuMap' -Message 'SKU map file not found' -Detail $Path
-  return $null
-}
-
-function Resolve-SkuIdsFromPartNumbers {
-  param(
-    [Parameter(Mandatory)]$SubscribedSkus,
-    [Parameter(Mandatory)][string[]]$PartNumbers
-  )
-  $ids = New-Object System.Collections.Generic.List[string]
-  foreach ($pn in $PartNumbers) {
-    $match = $SubscribedSkus | Where-Object { $_.SkuPartNumber -eq $pn } | Select-Object -First 1
-    if ($match -and $match.SkuId) {
-      $ids.Add([string]$match.SkuId)
-    }
-  }
-  return @($ids)
-}
-
-function Test-UserHasAnySkuId {
-  param($UserSkuIds, $WantedSkuIds)
-  foreach ($id in @($WantedSkuIds)) {
-    if (@($UserSkuIds) -contains $id) { return $true }
-  }
-  return $false
-}
-
-function Try-ParseJson {
-  param($Text)
-  try { return ($Text | ConvertFrom-Json -ErrorAction Stop) } catch { return $null }
-}
-
-function Disconnect-Safely {
-  param(
-    [Parameter(Mandatory)][ValidateSet('Graph','Exchange','SPO','PnP')][string]$ConnectionType,
-    [string]$Step = 'Disconnect'
-  )
-
-  try {
-    switch ($ConnectionType) {
-      'Graph'    { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null }
-      'Exchange' { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue }
-      'SPO'      { Disconnect-SPOService -ErrorAction SilentlyContinue }
-      'PnP'      { Disconnect-PnPOnline -ErrorAction SilentlyContinue }
-    }
-    Write-Log -Level Info -Step $Step -Message ("Disconnected {0}" -f $ConnectionType)
-  }
-  catch {
-    Write-Log -Level Warn -Step $Step -Message ("Disconnect warning for {0}: {1}" -f $ConnectionType, $_.Exception.Message)
-  }
 }
 
 function Connect-GraphSafe {
@@ -323,566 +274,170 @@ function Connect-GraphSafe {
   }
 }
 
+function Disconnect-Safely {
+  param(
+    [Parameter(Mandatory)][ValidateSet('Graph','Exchange','SPO','PnP')][string]$ConnectionType,
+    [string]$Step = 'Disconnect'
+  )
+
+  try {
+    switch ($ConnectionType) {
+      'Graph'    { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null }
+      'Exchange' { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue }
+      'PnP'      { Disconnect-PnPOnline -ErrorAction SilentlyContinue }
+      'SPO'      {
+        # No standard Disconnect-SPOService cmdlet exists.
+        # Intentionally treated as a no-op for cleanup.
+      }
+    }
+
+    Write-Log -Level Info -Step $Step -Message ("Disconnected / cleaned up {0}" -f $ConnectionType)
+  }
+  catch {
+    Write-Log -Level Warn -Step $Step -Message ("Disconnect warning for {0}: {1}" -f $ConnectionType, $_.Exception.Message)
+  }
+}
+
 # -------------------------------
-# Initialisation
+# Data helpers
 # -------------------------------
-Ensure-Folder -Path $OutputPath
-Initialize-Logging -BasePath $OutputPath
-Write-Log -Level Info -Step 'Startup' -Message ("Starting Copilot readiness export. SnapshotId={0}; Version={1}" -f $script:SnapshotId, $script:ScriptVersion)
-
-$org = $null
-$tenantId = $null
-$subscribedSkus = @()
-$users = @()
-$skuMap = $null
-$spoAdminUrl = $null
-$needsExchange = (-not $SkipExchange) -or $IncludePurview -or $IncludeDataClassification
-$needsSPO = -not $SkipSharePoint
-$needsPnP = $IncludeSharingLinks -and (-not $SkipSharePoint)
-
-try {
-  # -------------------------------
-  # 0) Bootstrap modules + upfront connections
-  # -------------------------------
-  Invoke-Step -Name 'Bootstrap-Modules' -ScriptBlock {
-    Ensure-PackageManagement
-    Ensure-Module -Name 'Microsoft.Graph' -MinimumVersion '2.0.0' -AllowClobber
-    if ($IncludeMfaMethods) {
-      Ensure-Module -Name 'Microsoft.Graph.Identity.SignIns' -MinimumVersion '2.0.0' -AllowClobber
-    }
-    if ($needsExchange) {
-      Ensure-Module -Name 'ExchangeOnlineManagement' -MinimumVersion '3.0.0' -AllowClobber
-    }
-    if ($needsSPO) {
-      Ensure-Module -Name 'Microsoft.Online.SharePoint.PowerShell' -AllowClobber
-    }
-    if ($needsPnP) {
-      Ensure-Module -Name 'PnP.PowerShell' -MinimumVersion '2.3.0' -AllowClobber
-    }
+function Read-SkuMap {
+  param([Parameter(Mandatory)][string]$Path)
+  if (Test-Path -LiteralPath $Path) {
+    return (Get-Content -Raw -Path $Path | ConvertFrom-Json -ErrorAction Stop)
   }
 
-  # -------------------------------
-  # 1) Microsoft Graph (core)
-  # -------------------------------
-  Invoke-Step -Name 'Connect-MgGraph' -ScriptBlock {
-    $scopes = @(
-      'Organization.Read.All',
-      'User.Read.All',
-      'Directory.Read.All',
-      'Policy.Read.All',
-      'Group.Read.All',
-      'LicenseAssignment.Read.All'
-    )
-    if ($IncludeMfaMethods) { $scopes += 'UserAuthenticationMethod.Read.All' }
-    Connect-GraphSafe -Scopes $scopes
+  Write-Log -Level Warn -Step 'Read-SkuMap' -Message ("SKU map file not found: {0}" -f $Path)
+  Add-RunIssue -Type Warning -Step 'Read-SkuMap' -Message 'SKU map file not found' -Detail $Path
+  return $null
+}
+
+function Resolve-SkuIdsFromPartNumbers {
+  param(
+    [Parameter(Mandatory)]$SubscribedSkus,
+    [Parameter(Mandatory)][string[]]$PartNumbers
+  )
+
+  $ids = New-Object System.Collections.Generic.List[string]
+  foreach ($pn in $PartNumbers) {
+    $match = $SubscribedSkus | Where-Object { $_.SkuPartNumber -eq $pn } | Select-Object -First 1
+    if ($match -and $match.SkuId) {
+      $ids.Add([string]$match.SkuId)
+    }
+  }
+  return @($ids)
+}
+
+function Test-UserHasAnySkuId {
+  param($UserSkuIds, $WantedSkuIds)
+
+  foreach ($id in @($WantedSkuIds)) {
+    if (@($UserSkuIds) -contains $id) { return $true }
+  }
+  return $false
+}
+
+function Try-ParseJson {
+  param($Text)
+  try { return ($Text | ConvertFrom-Json -ErrorAction Stop) } catch { return $null }
+}
+
+# -------------------------------
+# HTML report helpers
+# -------------------------------
+function Get-RagClass {
+  param(
+    [Parameter(Mandatory = $false)]$Score,
+    [string]$Priority = ''
+  )
+
+  try { $scoreValue = [int]$Score } catch { $scoreValue = -1 }
+
+  if ($Priority -eq 'P0' -and ($scoreValue -lt 50 -or $scoreValue -eq 0)) { return 'rag-red' }
+  if ($Priority -eq 'P1' -and ($scoreValue -lt 50 -or $scoreValue -eq 0)) { return 'rag-amber' }
+  if ($scoreValue -ge 80) { return 'rag-green' }
+  if ($scoreValue -ge 50) { return 'rag-amber' }
+  if ($scoreValue -ge 0)  { return 'rag-red' }
+  return 'rag-grey'
+}
+
+function New-HtmlReport {
+  param(
+    [Parameter(Mandatory)][string]$OutputPath,
+    [Parameter(Mandatory)][string]$SnapshotId
+  )
+
+  function Load-CsvSafe {
+    param([Parameter(Mandatory)][string]$Path)
+    if (Test-Path -LiteralPath $Path) { return @(Import-Csv -Path $Path) }
+    return @()
   }
 
-  $org = Invoke-Step -Name 'Get-Org' -ScriptBlock {
-    Get-MgOrganization -Property Id,DisplayName,VerifiedDomains
+  function Convert-ToHtmlSafe {
+    param([string]$Value)
+    if ($null -eq $Value) { return '' }
+    return [System.Net.WebUtility]::HtmlEncode([string]$Value)
   }
 
-  if (-not $org) { throw 'No organisation information returned from Microsoft Graph.' }
+  $tenant   = Load-CsvSafe -Path (Join-Path $OutputPath 'TenantSnapshot.csv')
+  $users    = Load-CsvSafe -Path (Join-Path $OutputPath 'Users_Licensing.csv')
+  $ca       = Load-CsvSafe -Path (Join-Path $OutputPath 'Entra_ConditionalAccess.csv')
+  $roles    = Load-CsvSafe -Path (Join-Path $OutputPath 'Entra_Roles.csv')
+  $groups   = Load-CsvSafe -Path (Join-Path $OutputPath 'Teams_Groups.csv')
+  $spo      = Load-CsvSafe -Path (Join-Path $OutputPath 'SharePoint_TenantSharing.csv')
+  $scores   = Load-CsvSafe -Path (Join-Path $OutputPath 'Summary_Scores.csv')
+  $warnings = Load-CsvSafe -Path (Join-Path $OutputPath 'Run_Warnings.csv')
+  $errors   = Load-CsvSafe -Path (Join-Path $OutputPath 'Run_Errors.csv')
 
-  $tenantId = $org.Id
-  if ([string]::IsNullOrWhiteSpace($TenantDomain)) {
-    $defaultDomain = $org.VerifiedDomains | Where-Object { $_.IsDefault -eq $true } | Select-Object -First 1
-    if ($defaultDomain -and $defaultDomain.Name) {
-      $TenantDomain = $defaultDomain.Name
+  $tenantRow = $tenant | Select-Object -First 1
+  $spoRow = $spo | Select-Object -First 1
+
+  $totalUsers = @($users).Count
+  $enabledUsers = @($users | Where-Object { $_.AccountEnabled -eq 'True' }).Count
+  $copilotAssigned = @($users | Where-Object { $_.HasCopilotAddOn -eq 'True' }).Count
+  $eligibleBaseUsers = @($users | Where-Object { $_.HasEligibleBaseSku -eq 'True' }).Count
+  $copilotCoverage = if ($totalUsers -gt 0) { [math]::Round(($copilotAssigned / $totalUsers) * 100, 1) } else { 0 }
+  $caPolicies = @($ca).Count
+  $groupsCount = @($groups).Count
+  $warningCount = @($warnings).Count
+  $errorCount = @($errors).Count
+  $scoreRows = @($scores)
+
+  $overallStatusClass = 'rag-grey'
+  if ($errorCount -gt 0) {
+    $overallStatusClass = 'rag-red'
+  }
+  elseif ($warningCount -gt 0) {
+    $overallStatusClass = 'rag-amber'
+  }
+  elseif (@($scores).Count -gt 0) {
+    if ((@($scores | Where-Object { (Get-RagClass -Score $_.Score -Priority $_.Priority) -eq 'rag-red' }).Count) -gt 0) {
+      $overallStatusClass = 'rag-red'
+    }
+    elseif ((@($scores | Where-Object { (Get-RagClass -Score $_.Score -Priority $_.Priority) -eq 'rag-amber' }).Count) -gt 0) {
+      $overallStatusClass = 'rag-amber'
     }
     else {
-      throw 'TenantDomain was not supplied and no default verified domain was returned by Graph.'
+      $overallStatusClass = 'rag-green'
     }
   }
 
-  if ($needsSPO -or $needsPnP) {
-    $spoAdminUrl = if ([string]::IsNullOrWhiteSpace($PnPTenantAdminUrl)) {
-      'https://' + ($TenantDomain.Split('.')[0]) + '-admin.sharepoint.com'
-    }
-    else {
-      $PnPTenantAdminUrl
-    }
-  }
+  $risks = New-Object System.Collections.Generic.List[object]
 
-  if ($needsSPO) {
-    Invoke-Step -Name 'Connect-SPOService' -ScriptBlock {
-      Connect-SPOService -Url $spoAdminUrl
-    } -ContinueOnError
-  }
-
-  if ($needsPnP) {
-    Invoke-Step -Name 'Connect-PnPAdmin' -ScriptBlock {
-      if ($UseDeviceAuthentication) {
-        Connect-PnPOnline -Url $spoAdminUrl -DeviceLogin
-      }
-      else {
-        Connect-PnPOnline -Url $spoAdminUrl -Interactive
-      }
-    } -ContinueOnError
-  }
-
-  if ($needsExchange) {
-    Invoke-Step -Name 'Connect-ExchangeOnline' -ScriptBlock {
-      if ($UseDeviceAuthentication) {
-        Connect-ExchangeOnline -ShowBanner:$false -Device
-      }
-      else {
-        Connect-ExchangeOnline -ShowBanner:$false
-      }
-    } -ContinueOnError
-  }
-
-  if ($IncludePurview -or $IncludeDataClassification) {
-    Invoke-Step -Name 'Connect-IPPSSession' -ScriptBlock {
-      Connect-IPPSSession | Out-Null
-    } -ContinueOnError
-  }
-
-  $snapshot = [pscustomobject]@{
-    SnapshotId    = $script:SnapshotId
-    TenantId      = $tenantId
-    TenantDomain  = $TenantDomain
-    TenantName    = $org.DisplayName
-    RunDateUtc    = $script:RunDateUtc
-    ScriptVersion = $script:ScriptVersion
-  }
-  Write-CsvSafe -Object @($snapshot) -Path (Join-Path $OutputPath 'TenantSnapshot.csv')
-
-  # -------------------------------
-  # 2) Licensing (via sku-map.json + Graph)
-  # -------------------------------
-  $skuMap = Read-SkuMap -Path $SkuMapPath
-
-  $subscribedSkus = Invoke-Step -Name 'Get-SubscribedSkus' -ScriptBlock {
-    Get-MgSubscribedSku -All
-  }
-
-  $eligibleBaseSkuIds = @()
-  $copilotSkuIds = @()
-  if ($skuMap) {
-    $eligibleBaseSkuIds = Resolve-SkuIdsFromPartNumbers -SubscribedSkus $subscribedSkus -PartNumbers @($skuMap.EligibleBaseSkuPartNumbers)
-    $copilotSkuIds = Resolve-SkuIdsFromPartNumbers -SubscribedSkus $subscribedSkus -PartNumbers @($skuMap.CopilotSkuPartNumbers)
-  }
-
-  $users = Invoke-Step -Name 'Get-Users' -ScriptBlock {
-    Get-MgUser -All -Property Id,DisplayName,UserPrincipalName,AccountEnabled,UserType
-  }
-
-  if ($PilotUsersUpn.Count -gt 0) {
-    $users = @($users | Where-Object { $PilotUsersUpn -contains $_.UserPrincipalName })
-    Write-Log -Level Info -Step 'Get-Users' -Message ("Filtered users to pilot list. Remaining={0}" -f @($users).Count)
-  }
-
-  if (-not @($users).Count) {
-    Add-RunIssue -Type Warning -Step 'Get-Users' -Message 'No users returned after filtering.'
-  }
-
-  $userRows = New-Object System.Collections.Generic.List[object]
-  foreach ($u in @($users)) {
-    $licenseDetail = Invoke-WithRetry -Name ("Get-UserLicenseDetail:{0}" -f $u.UserPrincipalName) -ScriptBlock {
-      Get-MgUserLicenseDetail -UserId $u.Id -ErrorAction Stop
-    } -MaxAttempts $RetryCount -InitialDelaySeconds $RetryDelaySeconds -NonTerminating
-
-    if ($null -eq $licenseDetail) {
-      $userRows.Add([pscustomobject]@{
-        SnapshotId             = $script:SnapshotId
-        UserPrincipalName      = $u.UserPrincipalName
-        DisplayName            = $u.DisplayName
-        AccountEnabled         = $u.AccountEnabled
-        UserType               = $u.UserType
-        AssignedSkuPartNumbers = ''
-        HasEligibleBaseSku     = if ($skuMap) { $false } else { 'Unknown' }
-        HasCopilotAddOn        = if ($skuMap) { $false } else { 'Unknown' }
-      })
-      continue
-    }
-
-    $userSkuIds = @($licenseDetail | Select-Object -ExpandProperty SkuId)
-    $hasEligibleBase = if ($skuMap) { Test-UserHasAnySkuId -UserSkuIds $userSkuIds -WantedSkuIds $eligibleBaseSkuIds } else { $null }
-    $hasCopilot = if ($skuMap) { Test-UserHasAnySkuId -UserSkuIds $userSkuIds -WantedSkuIds $copilotSkuIds } else { $null }
-
-    $userRows.Add([pscustomobject]@{
-      SnapshotId             = $script:SnapshotId
-      UserPrincipalName      = $u.UserPrincipalName
-      DisplayName            = $u.DisplayName
-      AccountEnabled         = $u.AccountEnabled
-      UserType               = $u.UserType
-      AssignedSkuPartNumbers = (($licenseDetail | ForEach-Object { $_.SkuPartNumber }) -join '|')
-      HasEligibleBaseSku     = if ($skuMap) { [bool]$hasEligibleBase } else { 'Unknown' }
-      HasCopilotAddOn        = if ($skuMap) { [bool]$hasCopilot } else { 'Unknown' }
+  if ($totalUsers -gt 0 -and $copilotAssigned -eq 0) {
+    $risks.Add([pscustomobject]@{
+      RAG           = 'Red'
+      Category      = 'Licensing'
+      Risk          = 'No users in the export are marked with Copilot add-on licences.'
+      WhyItMatters  = 'Copilot value cannot be realised until licensing is assigned to target users.'
+      Evidence      = ('Users_Licensing.csv shows 0 users with HasCopilotAddOn=True out of {0} users.' -f $totalUsers)
     })
   }
-  Write-CsvSafe -Object $userRows -Path (Join-Path $OutputPath 'Users_Licensing.csv')
-
-  # -------------------------------
-  # 3) Conditional Access policies
-  # -------------------------------
-  $ca = Invoke-Step -Name 'Get-ConditionalAccess' -ScriptBlock {
-    Get-MgIdentityConditionalAccessPolicy -All
-  } -ContinueOnError
-  $caRows = foreach ($p in @($ca)) {
-    [pscustomobject]@{
-      SnapshotId = $script:SnapshotId
-      PolicyId   = $p.Id
-      Name       = $p.DisplayName
-      State      = $p.State
-      Created    = $p.CreatedDateTime
-      Modified   = $p.ModifiedDateTime
-    }
-  }
-  Write-CsvSafe -Object $caRows -Path (Join-Path $OutputPath 'Entra_ConditionalAccess.csv')
-
-  # -------------------------------
-  # 4) Directory role assignments
-  # -------------------------------
-  $roles = Invoke-Step -Name 'Get-DirectoryRoles' -ScriptBlock {
-    Get-MgDirectoryRole -All
-  } -ContinueOnError
-
-  $roleAssignments = New-Object System.Collections.Generic.List[object]
-  foreach ($r in @($roles)) {
-    $members = Invoke-WithRetry -Name ("Get-DirectoryRoleMember:{0}" -f $r.DisplayName) -ScriptBlock {
-      Get-MgDirectoryRoleMember -DirectoryRoleId $r.Id -All
-    } -MaxAttempts $RetryCount -InitialDelaySeconds $RetryDelaySeconds -NonTerminating
-
-    foreach ($m in @($members)) {
-      $odataType = $null
-      if ($m.PSObject.Properties.Name -contains 'AdditionalProperties' -and $m.AdditionalProperties.ContainsKey('@odata.type')) {
-        $odataType = $m.AdditionalProperties['@odata.type']
-      }
-
-      $roleAssignments.Add([pscustomobject]@{
-        SnapshotId   = $script:SnapshotId
-        RoleName     = $r.DisplayName
-        AssigneeId   = $m.Id
-        AssigneeType = $odataType
-      })
-    }
-  }
-  Write-CsvSafe -Object $roleAssignments -Path (Join-Path $OutputPath 'Entra_Roles.csv')
-
-  # -------------------------------
-  # 5) Teams + Groups posture (via Graph)
-  # -------------------------------
-  if (-not $SkipTeams) {
-    $groupRows = New-Object System.Collections.Generic.List[object]
-    $groups = Invoke-Step -Name 'Get-Groups' -ScriptBlock {
-      Get-MgGroup -All -Property Id,DisplayName,Visibility,GroupTypes,ResourceProvisioningOptions,CreatedDateTime
-    } -ContinueOnError
-
-    foreach ($g in @($groups)) {
-      $isM365Group = @($g.GroupTypes) -contains 'Unified'
-      $hasTeam = @($g.ResourceProvisioningOptions) -contains 'Team'
-      if ($isM365Group -or $hasTeam) {
-        $owners = Invoke-WithRetry -Name ("Get-MgGroupOwner:{0}" -f $g.DisplayName) -ScriptBlock {
-          Get-MgGroupOwner -GroupId $g.Id -All
-        } -MaxAttempts $RetryCount -InitialDelaySeconds $RetryDelaySeconds -NonTerminating
-
-        $members = Invoke-WithRetry -Name ("Get-MgGroupMember:{0}" -f $g.DisplayName) -ScriptBlock {
-          Get-MgGroupMember -GroupId $g.Id -All
-        } -MaxAttempts $RetryCount -InitialDelaySeconds $RetryDelaySeconds -NonTerminating
-
-        $groupRows.Add([pscustomobject]@{
-          SnapshotId      = $script:SnapshotId
-          GroupId         = $g.Id
-          DisplayName     = $g.DisplayName
-          Visibility      = $g.Visibility
-          HasTeam         = $hasTeam
-          OwnersCount     = (@($owners) | Measure-Object).Count
-          MembersCount    = (@($members) | Measure-Object).Count
-          CreatedDateTime = $g.CreatedDateTime
-        })
-      }
-    }
-    Write-CsvSafe -Object $groupRows -Path (Join-Path $OutputPath 'Teams_Groups.csv')
-  }
-
-  # -------------------------------
-  # 6) SharePoint tenant sharing settings (SPO shell)
-  # -------------------------------
-  if (-not $SkipSharePoint) {
-    $spoRow = Invoke-Step -Name 'Get-SPOTenant' -ScriptBlock {
-      $tenant = Get-SPOTenant
-      [pscustomobject]@{
-        SnapshotId                                 = $script:SnapshotId
-        SharingCapability                          = $tenant.SharingCapability
-        DefaultSharingLinkType                     = $tenant.DefaultSharingLinkType
-        DefaultLinkPermission                      = $tenant.DefaultLinkPermission
-        RequireAcceptingAccountMatchInvitedAccount = $tenant.RequireAcceptingAccountMatchInvitedAccount
-        AllowedDomainList                          = (@($tenant.AllowedDomainList) -join ';')
-        BlockedDomainList                          = (@($tenant.BlockedDomainList) -join ';')
-      }
-    } -ContinueOnError
-
-    if ($spoRow) {
-      Write-CsvSafe -Object @($spoRow) -Path (Join-Path $OutputPath 'SharePoint_TenantSharing.csv')
-    }
-  }
-
-  # -------------------------------
-  # 7) SharePoint sharing link inventory (PnP) — top sites first
-  # -------------------------------
-  if ($IncludeSharingLinks -and -not $SkipSharePoint) {
-    Invoke-Step -Name 'PnP-SharingLinks' -ScriptBlock {
-      $sites = Get-PnPTenantSite -IncludeOneDriveSites:$false -Detailed -ErrorAction Stop |
-        Where-Object { $_.Url -like 'https://*sharepoint.com/sites/*' } |
-        Sort-Object -Property StorageUsageCurrent -Descending |
-        Select-Object -First $TopSites
-
-      $linkRows = New-Object System.Collections.Generic.List[object]
-      foreach ($s in @($sites)) {
-        if ($UseDeviceAuthentication) {
-          Connect-PnPOnline -Url $s.Url -DeviceLogin
-        }
-        else {
-          Connect-PnPOnline -Url $s.Url -Interactive
-        }
-
-        $lists = Get-PnPList | Where-Object { $_.BaseTemplate -eq 101 -and $_.Hidden -eq $false }
-        foreach ($list in @($lists)) {
-          $items = Get-PnPListItem -List $list -PageSize 500 -Fields 'FileRef','FileLeafRef' -ErrorAction SilentlyContinue
-          foreach ($it in @($items)) {
-            $ref = $it.FieldValues['FileRef']
-            if ([string]::IsNullOrWhiteSpace($ref)) { continue }
-            $sharingLinks = Get-PnPFileSharingLink -Identity $ref -ErrorAction SilentlyContinue
-            foreach ($sl in @($sharingLinks)) {
-              $linkRows.Add([pscustomobject]@{
-                SnapshotId       = $script:SnapshotId
-                SiteUrl          = $s.Url
-                ListTitle        = $list.Title
-                Name             = $it.FieldValues['FileLeafRef']
-                RelativeUrl      = $ref
-                ShareLinkUrl     = $sl.Link.WebUrl
-                ShareLinkType    = $sl.Link.Type
-                ShareLinkScope   = $sl.Link.Scope
-                Expiration       = $sl.ExpirationDateTime
-                RequiresPassword = $sl.HasPassword
-              })
-            }
-          }
-        }
-      }
-      Write-CsvSafe -Object $linkRows -Path (Join-Path $OutputPath 'SharePoint_SharingLinks_TopSites.csv')
-
-      if ($UseDeviceAuthentication) {
-        Connect-PnPOnline -Url $spoAdminUrl -DeviceLogin
-      }
-      else {
-        Connect-PnPOnline -Url $spoAdminUrl -Interactive
-      }
-    } -ContinueOnError
-  }
-
-  # -------------------------------
-  # 8) MFA method coverage (Graph)
-  # -------------------------------
-  if ($IncludeMfaMethods) {
-    Invoke-Step -Name 'MFA-Methods' -ScriptBlock {
-      $mfaRows = New-Object System.Collections.Generic.List[object]
-      foreach ($u in @($users)) {
-        $methods = Invoke-WithRetry -Name ("Get-MgUserAuthenticationMethod:{0}" -f $u.UserPrincipalName) -ScriptBlock {
-          Get-MgUserAuthenticationMethod -UserId $u.Id -All -ErrorAction Stop
-        } -MaxAttempts $RetryCount -InitialDelaySeconds $RetryDelaySeconds -NonTerminating
-
-        $methodTypes = @($methods | ForEach-Object { $_.AdditionalProperties['@odata.type'] })
-        $nonPassword = @($methodTypes | Where-Object { $_ -and $_ -notmatch 'passwordAuthenticationMethod' })
-
-        $mfaRows.Add([pscustomobject]@{
-          SnapshotId           = $script:SnapshotId
-          UserPrincipalName    = $u.UserPrincipalName
-          DisplayName          = $u.DisplayName
-          AuthMethodTypes      = ($methodTypes -join '|')
-          StrongAuthRegistered = ($nonPassword.Count -gt 0)
-          AuthMethodsCount     = $methodTypes.Count
-        })
-      }
-      Write-CsvSafe -Object $mfaRows -Path (Join-Path $OutputPath 'Entra_MFA_Methods.csv')
-    } -ContinueOnError
-  }
-
-  # -------------------------------
-  # 9) Exchange Online mailbox inventory
-  # -------------------------------
-  if (-not $SkipExchange) {
-    Invoke-Step -Name 'Exchange-Mailboxes' -ScriptBlock {
-      $mbx = Get-EXOMailbox -ResultSize Unlimited -Properties DisplayName,UserPrincipalName,RecipientTypeDetails,IsMailboxEnabled
-      $mbxRows = $mbx | Select-Object @{n='SnapshotId';e={$script:SnapshotId}}, DisplayName, UserPrincipalName, RecipientTypeDetails, IsMailboxEnabled
-      Write-CsvSafe -Object $mbxRows -Path (Join-Path $OutputPath 'Exchange_Mailboxes.csv')
-    } -ContinueOnError
-  }
-
-  # -------------------------------
-  # 10) Purview: labels + label policies + DLP policies (S&C PowerShell)
-  # -------------------------------
-  if ($IncludePurview) {
-    Invoke-Step -Name 'Purview-Labels' -ScriptBlock {
-      $labels = Get-Label -ErrorAction Stop
-      $labelRows = foreach ($l in @($labels)) {
-        [pscustomobject]@{
-          SnapshotId  = $script:SnapshotId
-          LabelId     = $l.ImmutableId
-          LabelName   = $l.DisplayName
-          Enabled     = $l.Disabled -ne $true
-          Priority    = $l.Priority
-          ContentType = $l.ContentType
-        }
-      }
-      Write-CsvSafe -Object $labelRows -Path (Join-Path $OutputPath 'Purview_Labels.csv')
-    } -ContinueOnError
-
-    Invoke-Step -Name 'Purview-LabelPolicies' -ScriptBlock {
-      $policies = Get-LabelPolicy -ErrorAction Stop
-      $policyRows = foreach ($p in @($policies)) {
-        [pscustomobject]@{
-          SnapshotId         = $script:SnapshotId
-          PolicyName         = $p.DisplayName
-          Mode               = $p.Mode
-          DistributionStatus = $p.DistributionStatus
-          Locations          = (@($p.ExchangeLocation) -join '|')
-        }
-      }
-      Write-CsvSafe -Object $policyRows -Path (Join-Path $OutputPath 'Purview_LabelPolicies.csv')
-    } -ContinueOnError
-
-    Invoke-Step -Name 'Purview-DlpPolicies' -ScriptBlock {
-      $dlp = Get-DlpCompliancePolicy -ErrorAction Stop
-      $dlpRows = foreach ($d in @($dlp)) {
-        [pscustomobject]@{
-          SnapshotId = $script:SnapshotId
-          PolicyName = $d.Name
-          Mode       = $d.Mode
-          Workload   = $d.Workload
-          Enabled    = $d.Enabled
-        }
-      }
-      Write-CsvSafe -Object $dlpRows -Path (Join-Path $OutputPath 'Purview_DlpPolicies.csv')
-    } -ContinueOnError
-  }
-
-  # -------------------------------
-  # 11) Purview data classification discovery: SITs + trainable classifier usage in policies
-  # -------------------------------
-  if ($IncludeDataClassification) {
-    Invoke-Step -Name 'Purview-SITs' -ScriptBlock {
-      $sits = Get-DlpSensitiveInformationType -ErrorAction Stop
-      $sitRows = foreach ($s in @($sits)) {
-        [pscustomobject]@{
-          SnapshotId            = $script:SnapshotId
-          Name                  = $s.Name
-          Id                    = $s.Id
-          Publisher             = $s.Publisher
-          RecommendedConfidence = $s.RecommendedConfidence
-        }
-      }
-      Write-CsvSafe -Object $sitRows -Path (Join-Path $OutputPath 'Purview_SITs.csv')
-    } -ContinueOnError
-
-    Invoke-Step -Name 'Purview-AutoLabelRules' -ScriptBlock {
-      $auto = Get-AutoSensitivityLabelRule -ErrorAction Stop
-      $autoRows = foreach ($r in @($auto)) {
-        [pscustomobject]@{
-          SnapshotId = $script:SnapshotId
-          RuleName   = $r.Name
-          Mode       = $r.Mode
-          Enabled    = $r.Enabled
-          Workload   = (@($r.Workload) -join '|')
-        }
-      }
-      Write-CsvSafe -Object $autoRows -Path (Join-Path $OutputPath 'Purview_AutoLabelRules.csv')
-    } -ContinueOnError
-
-    Invoke-Step -Name 'Purview-DlpRules' -ScriptBlock {
-      $rules = Get-DlpComplianceRule -ErrorAction Stop
-      $ruleRows = foreach ($r in @($rules)) {
-        [pscustomobject]@{
-          SnapshotId = $script:SnapshotId
-          RuleName   = $r.Name
-          PolicyName = $r.ParentPolicyName
-          Mode       = $r.Mode
-          Enabled    = $r.Enabled
-        }
-      }
-      Write-CsvSafe -Object $ruleRows -Path (Join-Path $OutputPath 'Purview_DlpRules.csv')
-    } -ContinueOnError
-
-    Invoke-Step -Name 'Purview-TrainableClassifierUsage' -ScriptBlock {
-      $usage = New-Object System.Collections.Generic.List[object]
-      $auto = @()
-      $dlp = @()
-
-      try { $auto = Get-AutoSensitivityLabelRule -ErrorAction Stop } catch { Write-Log -Level Warn -Step 'Purview-TrainableClassifierUsage' -Message $_.Exception.Message }
-      try { $dlp  = Get-DlpComplianceRule -ErrorAction Stop } catch { Write-Log -Level Warn -Step 'Purview-TrainableClassifierUsage' -Message $_.Exception.Message }
-
-      foreach ($r in @($auto)) {
-        if ([string]::IsNullOrWhiteSpace($r.AdvancedRule)) { continue }
-        if ($r.AdvancedRule -notmatch 'MLModel') { continue }
-        $obj = Try-ParseJson -Text $r.AdvancedRule
-        if (-not $obj) { continue }
-        $json = $obj | ConvertTo-Json -Depth 30
-        $matches = [regex]::Matches($json, '"Name"\s*:\s*"([^"]+)"\s*,\s*"ClassifierType"\s*:\s*"MLModel"')
-        foreach ($m in $matches) {
-          $usage.Add([pscustomobject]@{
-            SnapshotId     = $script:SnapshotId
-            PolicyType     = 'AutoLabel'
-            RuleName       = $r.Name
-            ClassifierName = $m.Groups[1].Value
-          })
-        }
-      }
-
-      foreach ($r in @($dlp)) {
-        if ([string]::IsNullOrWhiteSpace($r.AdvancedRule)) { continue }
-        if ($r.AdvancedRule -notmatch 'MLModel') { continue }
-        $obj = Try-ParseJson -Text $r.AdvancedRule
-        if (-not $obj) { continue }
-        $json = $obj | ConvertTo-Json -Depth 30
-        $matches = [regex]::Matches($json, '"Name"\s*:\s*"([^"]+)"\s*,\s*"ClassifierType"\s*:\s*"MLModel"')
-        foreach ($m in $matches) {
-          $usage.Add([pscustomobject]@{
-            SnapshotId     = $script:SnapshotId
-            PolicyType     = 'DLP'
-            RuleName       = $r.Name
-            ClassifierName = $m.Groups[1].Value
-          })
-        }
-      }
-
-      $finalUsage = @($usage | Sort-Object PolicyType, RuleName, ClassifierName -Unique)
-      Write-CsvSafe -Object $finalUsage -Path (Join-Path $OutputPath 'Purview_TrainableClassifiers_Usage.csv')
-    } -ContinueOnError
-  }
-
-  # -------------------------------
-  # 12) Compute simple scores (placeholder logic)
-  # -------------------------------
-  $scores = @(
-    [pscustomobject]@{ SnapshotId=$script:SnapshotId; Domain='Licensing & prerequisites'; Score=0; Priority='P0'; Notes= if($skuMap){ 'Computed via sku-map.json' } else { 'No SKU map provided' } },
-    [pscustomobject]@{ SnapshotId=$script:SnapshotId; Domain='Identity & access'; Score=0; Priority='P0'; Notes= if($IncludeMfaMethods){ 'Includes registered MFA methods export' } else { 'No MFA method export' } },
-    [pscustomobject]@{ SnapshotId=$script:SnapshotId; Domain='Endpoint & network'; Score=0; Priority='P1'; Notes='Populate after device/apps inventory' },
-    [pscustomobject]@{ SnapshotId=$script:SnapshotId; Domain='Data governance & permissions'; Score=0; Priority='P0'; Notes= if($IncludeSharingLinks){ 'Includes top-site sharing links inventory' } else { 'No sharing links inventory' } },
-    [pscustomobject]@{ SnapshotId=$script:SnapshotId; Domain='Purview protection & compliance'; Score=0; Priority='P0'; Notes= if($IncludePurview){ 'Includes labels/policies/DLP exports' } else { 'No Purview exports' } },
-    [pscustomobject]@{ SnapshotId=$script:SnapshotId; Domain='Sensitive information discovery'; Score=0; Priority='P0'; Notes= if($IncludeDataClassification){ 'Includes SITs and trainable classifier usage exports' } else { 'No classification exports' } },
-    [pscustomobject]@{ SnapshotId=$script:SnapshotId; Domain='Security monitoring & operations'; Score=0; Priority='P1'; Notes='Populate after ops review' }
-  )
-  Write-CsvSafe -Object $scores -Path (Join-Path $OutputPath 'Summary_Scores.csv')
-}
-finally {
-  # -------------------------------
-  # 13) Export transparency artefacts
-  # -------------------------------
-  if ($script:Warnings.Count -gt 0) {
-    Write-CsvSafe -Object $script:Warnings -Path (Join-Path $OutputPath 'Run_Warnings.csv')
-  }
-  if ($script:Errors.Count -gt 0) {
-    Write-CsvSafe -Object $script:Errors -Path (Join-Path $OutputPath 'Run_Errors.csv')
-  }
-  if ($script:Summary.Count -gt 0) {
-    Write-CsvSafe -Object $script:Summary -Path (Join-Path $OutputPath 'Run_Summary.csv')
-  }
-
-  Disconnect-Safely -ConnectionType 'PnP' -Step 'Cleanup'
-  Disconnect-Safely -ConnectionType 'SPO' -Step 'Cleanup'
-  Disconnect-Safely -ConnectionType 'Exchange' -Step 'Cleanup'
-  Disconnect-Safely -ConnectionType 'Graph' -Step 'Cleanup'
-
-  Write-Log -Level Info -Step 'Shutdown' -Message ("Done. SnapshotId: {0}" -f $script:SnapshotId)
-}
+  elseif ($copilotCoverage -lt 20 -and $totalUsers -gt 0) {
+    $risks.Add([pscustomobject]@{
+      RAG           = 'Amber'
+      Category      = 'Licensing'
+      Risk          = 'Copilot licence assignment appears limited across the exported user set.'
+      WhyItMatters  = 'Pilot scale may be too small to validate readiness across representative personas and workloads.'
+      Evidence      = ('Users_Licensing.csv shows {0}% coverage ({1}/{2} users).' -f $copilotCoverage, $copilotAssigned, $totalUsers)
+    })
