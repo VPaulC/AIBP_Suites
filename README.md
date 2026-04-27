@@ -224,4 +224,146 @@ Keep documented rollback: remove user from scope group or flip policy back to re
 ✅ **Troubleshooting Table**: Easy reference for common issues
 ✅ **White Space**: Reduced density with strategic breaks and horizontal rules
 
+### GitHub README — Usage examples (copy/paste)
+
+## Quick start (baseline)
+
+Exports core readiness signals (Graph + CA + roles + groups + SPO tenant sharing + EXO mailboxes).
+
+```powershell
+.\CopilotReadinessExport.ps1 -OutputPath ".\Out"
+```
+
+## Full run (recommended for assessments)
+
+Adds sharing links, MFA method registration, Purview exports, plus SIT/trainable classifier discovery.
+
+```powershell
+.\CopilotReadinessExport.ps1 `
+  -OutputPath ".\Out" `
+  -IncludeSharingLinks -TopSites 25 `
+  -IncludeMfaMethods `
+  -IncludePurview `
+  -IncludeDataClassification
+```
+
+## Pilot-only run (faster / safer for first test)
+
+Scope the user-based exports to a known pilot group.
+
+```powershell
+.\CopilotReadinessExport.ps1 `
+  -OutputPath ".\Out" `
+  -PilotUsersUpn @("user1@domain.com","user2@domain.com") `
+  -IncludeMfaMethods `
+  -IncludePurview
+```
+
+## Use a custom SKU map path
+
+Helpful if you keep mappings in a `config` folder.
+
+```powershell
+.\CopilotReadinessExport.ps1 `
+  -OutputPath ".\Out" `
+  -SkuMapPath ".\config\sku-map.json"
+```
+
+## Specify SharePoint admin URL explicitly
+
+Recommended when tenants have non-standard domains or you want to avoid auto-derivation.
+
+```powershell
+.\CopilotReadinessExport.ps1 `
+  -OutputPath ".\Out" `
+  -PnPTenantAdminUrl "https://<tenant>-admin.sharepoint.com" `
+  -IncludeSharingLinks -TopSites 25
+```
+
+## Reduce SharePoint workload (throttling-friendly)
+
+```powershell
+.\CopilotReadinessExport.ps1 `
+  -OutputPath ".\Out" `
+  -IncludeSharingLinks -TopSites 10
+```
+
+## Skip specific workloads (troubleshooting)
+
+### Skip Exchange Online
+
+```powershell
+.\CopilotReadinessExport.ps1 -OutputPath ".\Out" -SkipExchange
+```
+
+### Skip SharePoint (both SPO settings + PnP inventory)
+
+```powershell
+.\CopilotReadinessExport.ps1 -OutputPath ".\Out" -SkipSharePoint
+```
+
+## What you get (outputs)
+
+At minimum (baseline):
+
+*   `TenantSnapshot.csv`
+*   `Users_Licensing.csv`
+*   `Entra_ConditionalAccess.csv`
+*   `Entra_Roles.csv`
+*   `Teams_Groups.csv`
+*   `SharePoint_TenantSharing.csv`
+*   `Exchange_Mailboxes.csv` (unless `-SkipExchange`)
+*   `Summary_Scores.csv`
+*   `Run_Errors.csv` (only if something fails)
+
+When switches are enabled:
+
+*   `-IncludeSharingLinks` → `SharePoint_SharingLinks_TopSites.csv`
+*   `-IncludeMfaMethods` → `Entra_MFA_Methods.csv`
+*   `-IncludePurview` → `Purview_Labels.csv`, `Purview_LabelPolicies.csv`, `Purview_DlpPolicies.csv`
+*   `-IncludeDataClassification` → `Purview_SITs.csv`, `Purview_AutoLabelRules.csv`, `Purview_DlpRules.csv`, `Purview_TrainableClassifiers_Usage.csv`
+
+## Evidence collection (sensitive content counts) — optional
+
+These are typically run separately with Security & Compliance PowerShell due to higher permissions.
+
+### Content Explorer (paged export example)
+
+```powershell
+Connect-IPPSSession
+
+$pageCookie = $null
+do {
+  $resp = Export-ContentExplorerData `
+    -TagType SensitiveInformationType `
+    -TagName "Credit Card Number" `
+    -Workload EXO `
+    -PageSize 500 `
+    -PageCookie $pageCookie
+
+  $meta = $resp[0]
+  $rows = $resp[1..($resp.Count-1)]
+  $rows | Export-Csv -NoTypeInformation -Append -Encoding UTF8 -Path ".\Out\Purview_ContentExplorer_SIT_CreditCard_EXO.csv"
+
+  $pageCookie = $meta.PageCookie
+} while ($meta.MorePagesAvailable -eq $true)
+```
+
+### Activity Explorer (last 30 days example)
+
+```powershell
+Connect-IPPSSession
+
+$start = (Get-Date).AddDays(-30)
+$end   = Get-Date
+
+Export-ActivityExplorerData -StartTime $start -EndTime $end -OutputFormat Csv |
+  Export-Csv -NoTypeInformation -Encoding UTF8 -Path ".\Out\Purview_ActivityExplorer_Last30Days.csv"
+```
+
+## Key takeaways
+
+*   Use **baseline** first, then layer on switches.
+*   `Run_Errors.csv` is the quickest way to diagnose missing permissions/modules.
+*   For **sensitive content counts**, use the optional **Content/Activity Explorer** export workflow separately (higher privilege).
 
