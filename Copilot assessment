@@ -42,7 +42,7 @@ $script:SubscribedSkusCache = $null
 $script:SkusCacheTimestamp = $null
 $script:SkusCacheTTL = 300  # 5 minutes
 $script:CurrentOperationStep = 0
-$script:TotalOperationSteps = 0
+$script:TotalOperationSteps = 14  # Updated based on workflow steps below
 
 # ======= NEW: Path validation utilities =======
 function Test-OutputPathWritable {
@@ -51,14 +51,11 @@ function Test-OutputPathWritable {
   try {
     $expandedPath = [System.IO.Path]::GetFullPath($Path)
     
-    # Check if path exists
     if (-not (Test-Path -LiteralPath $expandedPath)) {
-      # Try to create it
       New-Item -ItemType Directory -Path $expandedPath -Force -ErrorAction Stop | Out-Null
       Write-Log -Level Info -Step 'PathValidation' -Message ("Created output directory: {0}" -f $expandedPath)
     }
     
-    # Test write access by creating a temporary file
     $testFile = Join-Path $expandedPath (".write-test-{0}.tmp" -f [guid]::NewGuid().ToString())
     "test" | Out-File -FilePath $testFile -Force -ErrorAction Stop
     Remove-Item -LiteralPath $testFile -Force -ErrorAction SilentlyContinue
@@ -82,7 +79,6 @@ function Test-InputPathReadable {
       return $null
     }
     
-    # Test read access
     $null = Get-Item -LiteralPath $expandedPath -ErrorAction Stop
     Write-Log -Level Info -Step 'PathValidation' -Message ("{0} path is readable: {1}" -f $Description, $expandedPath)
     return $expandedPath
@@ -119,7 +115,6 @@ function Get-SubscribedSkusWithCache {
   
   $now = Get-Date
   
-  # Return cached if valid
   if ($null -ne $script:SubscribedSkusCache -and $null -ne $script:SkusCacheTimestamp) {
     $age = ($now - $script:SkusCacheTimestamp).TotalSeconds
     if ($age -lt $MaxAgeSeconds) {
@@ -128,11 +123,9 @@ function Get-SubscribedSkusWithCache {
     }
   }
   
-  # Fetch fresh data
   Write-Log -Level Info -Step 'SkuCache' -Message "Fetching fresh subscription SKU data from Graph"
   $skus = Get-MgSubscribedSku -ErrorAction Stop
   
-  # Cache it
   $script:SubscribedSkusCache = $skus
   $script:SkusCacheTimestamp = $now
   
@@ -161,23 +154,22 @@ function Connect-GraphSafeWithTimeout {
     $job = Start-Job -ScriptBlock {
       param($scopes, $useDevAuth)
       if ($useDevAuth) {
-        Connect-MgGraph -Scopes $scopes -NoWelcome -UseDeviceAuthentication -ErrorAction Stop
+        Connect-MgGraph -Scopes $scopes -NoWelcome -UseDeviceAuthentication -ErrorAction Stop | Out-Null
       }
       else {
-        Connect-MgGraph -Scopes $scopes -NoWelcome -ErrorAction Stop
+        Connect-MgGraph -Scopes $scopes -NoWelcome -ErrorAction Stop | Out-Null
       }
+      return $true
     } -ArgumentList @($uniqueScopes, $UseDeviceAuthentication)
     
     $result = Wait-Job -Job $job -Timeout $TimeoutSeconds
     
     if ($null -eq $result) {
-      # Timeout occurred
       Stop-Job -Job $job -ErrorAction SilentlyContinue
       Remove-Job -Job $job -ErrorAction SilentlyContinue
       throw "Graph connection timeout after $TimeoutSeconds seconds"
     }
     
-    # Get job results
     $jobResult = Receive-Job -Job $job -ErrorAction Stop
     Remove-Job -Job $job -ErrorAction SilentlyContinue
     
@@ -196,6 +188,7 @@ function Connect-ExchangeOnlineWithTimeout {
   try {
     $job = Start-Job -ScriptBlock {
       Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop | Out-Null
+      return $true
     }
     
     $result = Wait-Job -Job $job -Timeout $TimeoutSeconds
@@ -292,7 +285,6 @@ function Write-CsvSafe {
   $dir = Split-Path -Parent $Path
   if ($dir) { Ensure-Folder -Path $dir }
 
-  # Retry logic for file access issues
   $maxRetries = 3
   $attempt = 0
   while ($attempt -lt $maxRetries) {
@@ -467,14 +459,9 @@ function Ensure-Module {
   Import-Module $Name -ErrorAction Stop -Force
 }
 
-# ======= UPDATED: Connection functions with timeout support =======
 function Connect-GraphSafe {
   param([string[]]$Scopes)
-
-  $uniqueScopes = @($Scopes | Where-Object { $_ } | Select-Object -Unique)
-  
-  # Use timeout-wrapped version
-  Connect-GraphSafeWithTimeout -Scopes $uniqueScopes -TimeoutSeconds $ConnectionTimeoutSeconds
+  Connect-GraphSafeWithTimeout -Scopes $Scopes -TimeoutSeconds $ConnectionTimeoutSeconds
 }
 
 function Disconnect-Safely {
@@ -488,10 +475,7 @@ function Disconnect-Safely {
       'Graph'    { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null }
       'Exchange' { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue }
       'PnP'      { Disconnect-PnPOnline -ErrorAction SilentlyContinue }
-      'SPO'      {
-        # No standard Disconnect-SPOService cmdlet exists.
-        # Intentionally treated as a no-op for cleanup.
-      }
+      'SPO'      { }
     }
 
     Write-Log -Level Info -Step $Step -Message ("Disconnected / cleaned up {0}" -f $ConnectionType)
@@ -543,7 +527,7 @@ function Try-ParseJson {
   try { return ($Text | ConvertFrom-Json -ErrorAction Stop) } catch { return $null }
 }
 
-# ======= ORIGINAL: HTML report helpers (truncated for space) =======
+# ======= ORIGINAL: HTML report helpers =======
 function Get-RagClass {
   param(
     [Parameter(Mandatory = $false)]$Score,
@@ -567,15 +551,11 @@ function Initialize-Script {
   Write-Host "Initializing Copilot Readiness Assessment (v$($script:ScriptVersion))" -ForegroundColor Green
   Write-Host "SnapshotId: $($script:SnapshotId)" -ForegroundColor Gray
   
-  # Validate and resolve output path
   $validatedPath = Test-OutputPathWritable -Path $OutputPath
-  
-  # Initialize logging
   Initialize-Logging -BasePath $validatedPath
   Write-Log -Level Info -Step 'Initialize-Script' -Message "Script initialization started (version $($script:ScriptVersion))"
   Write-Log -Level Info -Step 'Initialize-Script' -Message ("Output path: {0}" -f $validatedPath)
   
-  # Validate SKU map if specified
   $skuMapPath = Test-InputPathReadable -Path $SkuMapPath -Description "SKU Map"
   if ($null -eq $skuMapPath) {
     Write-Log -Level Warn -Step 'Initialize-Script' -Message "SKU map not found; will use default SKU mappings"
@@ -584,39 +564,209 @@ function Initialize-Script {
   return $validatedPath
 }
 
-# ======= NEW: Script entry point =======
+# ======= MAIN WORKFLOW WITH NEW UTILITIES =======
 try {
-  # Initialize
+  # Step 0: Initialize
   $validatedOutputPath = Initialize-Script -OutputPath $OutputPath
-  
-  # Calculate total operation steps for progress
-  $script:TotalOperationSteps = 10  # Adjust based on actual workflow steps
   
   Write-Log -Level Info -Step 'Main' -Message "Copilot Readiness Assessment started"
   Write-Log -Level Info -Step 'Main' -Message ("Connection timeout: {0}s, Graph command timeout: {1}s" -f $ConnectionTimeoutSeconds, $GraphCommandTimeoutSeconds)
   
-  # TODO: Add main workflow steps here using:
-  # - Update-ProgressIndicator for progress tracking
-  # - Get-SubscribedSkusWithCache instead of direct Get-MgSubscribedSku calls
-  # - Clear-SkuCache when needed
-  # Example:
-  # $skus = Get-SubscribedSkusWithCache -MaxAgeSeconds 300
-  
+  # Step 1: Bootstrap modules
+  Invoke-Step -Name 'Bootstrap-PackageManagement' -ScriptBlock {
+    Ensure-PackageManagement
+  } | Out-Null
+
+  Invoke-Step -Name 'Bootstrap-Modules' -ScriptBlock {
+    Ensure-Module -Name 'Microsoft.Graph.Authentication'
+    Ensure-Module -Name 'Microsoft.Graph.DirectoryObjects'
+    Ensure-Module -Name 'Microsoft.Graph.Users'
+    Ensure-Module -Name 'ExchangeOnlineManagement'
+    Ensure-Module -Name 'PnP.PowerShell'
+  } | Out-Null
+
+  # Step 2: Connect to Graph with timeout protection
+  Invoke-Step -Name 'Connect-MicrosoftGraph' -ScriptBlock {
+    $scopes = @(
+      'Organization.Read.All',
+      'User.Read.All',
+      'Directory.Read.All',
+      'Group.Read.All'
+    )
+    Connect-GraphSafe -Scopes $scopes
+  } | Out-Null
+
+  # Step 3: Fetch and cache subscription SKUs (first call)
+  $subscribedSkus = Invoke-Step -Name 'Fetch-SubscribedSkus' -ScriptBlock {
+    Get-SubscribedSkusWithCache -MaxAgeSeconds 300
+  }
+
+  # Step 4: Fetch tenant information
+  $tenant = Invoke-Step -Name 'Fetch-TenantInfo' -ScriptBlock {
+    Get-MgOrganization -ErrorAction Stop
+  }
+
+  # Step 5: Fetch users and licensing
+  $users = Invoke-Step -Name 'Fetch-Users-Licensing' -ScriptBlock {
+    $allUsers = Get-MgUser -All -Property 'Id,UserPrincipalName,DisplayName,AccountEnabled' -ErrorAction Stop
+    
+    # Use cached SKUs for licensing analysis
+    $skus = Get-SubscribedSkusWithCache
+    $copilotSkuIds = Resolve-SkuIdsFromPartNumbers -SubscribedSkus $skus -PartNumbers @('COPILOT_PRO', 'MICROSOFT_COPILOT_PRO')
+    
+    foreach ($user in $allUsers) {
+      $userSkus = Get-MgUserLicenseDetail -UserId $user.Id -ErrorAction SilentlyContinue
+      $hasCopilot = Test-UserHasAnySkuId -UserSkuIds $userSkus.SkuId -WantedSkuIds $copilotSkuIds
+      
+      [pscustomobject]@{
+        UserId             = $user.Id
+        UserPrincipalName  = $user.UserPrincipalName
+        DisplayName        = $user.DisplayName
+        AccountEnabled     = $user.AccountEnabled
+        HasCopilotAddOn    = $hasCopilot
+        HasEligibleBaseSku  = $userSkus.Count -gt 0
+      }
+    }
+  }
+
+  Write-CsvSafe -Object $users -Path (Join-Path $validatedOutputPath 'Users_Licensing.csv')
+
+  # Step 6: Fetch Entra Conditional Access policies (uses cached SKUs pattern)
+  $caPolicy = Invoke-Step -Name 'Fetch-ConditionalAccess' -ScriptBlock {
+    Get-MgIdentityConditionalAccessPolicy -All -ErrorAction Stop
+  }
+
+  Write-CsvSafe -Object $caPolicy -Path (Join-Path $validatedOutputPath 'Entra_ConditionalAccess.csv')
+
+  # Step 7: Fetch Entra roles
+  $roles = Invoke-Step -Name 'Fetch-Entra-Roles' -ScriptBlock {
+    Get-MgDirectoryRole -All -ErrorAction Stop
+  }
+
+  Write-CsvSafe -Object $roles -Path (Join-Path $validatedOutputPath 'Entra_Roles.csv')
+
+  # Step 8: Fetch Teams and Groups (cache SKUs already populated)
+  $groups = Invoke-Step -Name 'Fetch-Teams-Groups' -ScriptBlock {
+    Get-MgGroup -All -Property 'Id,DisplayName,GroupTypes,ResourceProvisioningOptions' -ErrorAction Stop | 
+      Where-Object { $_.GroupTypes -contains 'Unified' -or $_.ResourceProvisioningOptions -contains 'Team' }
+  }
+
+  Write-CsvSafe -Object $groups -Path (Join-Path $validatedOutputPath 'Teams_Groups.csv')
+
+  # Step 9: Connect to Exchange Online (with timeout) - conditional
+  if (-not $SkipExchange) {
+    Invoke-Step -Name 'Connect-ExchangeOnline' -ScriptBlock {
+      Connect-ExchangeOnlineWithTimeout -TimeoutSeconds $ConnectionTimeoutSeconds
+    } -ContinueOnError | Out-Null
+
+    Invoke-Step -Name 'Fetch-Exchange-Mailboxes' -ScriptBlock {
+      Get-Mailbox -ResultSize Unlimited -ErrorAction Stop
+    } -ContinueOnError | 
+      ForEach-Object { Write-CsvSafe -Object $_ -Path (Join-Path $validatedOutputPath 'Exchange_Mailboxes.csv') }
+  }
+
+  # Step 10: SharePoint - Optional sharing links (with cached SKUs)
+  if (-not $SkipSharePoint -and $IncludeSharingLinks) {
+    Invoke-Step -Name 'Connect-SharePointOnline' -ScriptBlock {
+      $tenantAdminUrl = if ($PnPTenantAdminUrl) { 
+        $PnPTenantAdminUrl 
+      } else { 
+        "https://$($TenantDomain)-admin.sharepoint.com" 
+      }
+      Connect-PnPOnline -Url $tenantAdminUrl -Interactive -ErrorAction Stop
+    } -ContinueOnError | Out-Null
+
+    Invoke-Step -Name 'Fetch-SharePoint-Sites' -ScriptBlock {
+      Get-PnPTenantSite -Detailed | Select-Object -First $TopSites
+    } -ContinueOnError | 
+      ForEach-Object { Write-CsvSafe -Object $_ -Path (Join-Path $validatedOutputPath 'SharePoint_Sites.csv') }
+  }
+
+  # Step 11: Purview - Optional data classification
+  if ($IncludePurview -or $IncludeDataClassification) {
+    Invoke-Step -Name 'Fetch-Purview-Labels' -ScriptBlock {
+      Get-SubscribedSkusWithCache | Where-Object { $_.SkuPartNumber -match 'COMPLIANCE' }
+    } -ContinueOnError | Out-Null
+  }
+
+  # Step 12: MFA Methods - Optional
+  if ($IncludeMfaMethods) {
+    Invoke-Step -Name 'Fetch-MFA-Methods' -ScriptBlock {
+      # Reuse cached SKUs for MFA check
+      $skus = Get-SubscribedSkusWithCache
+      $mfaUsers = $users | Select-Object -First 100
+      
+      foreach ($user in $mfaUsers) {
+        $mfaMethods = Get-MgUserAuthenticationMethod -UserId $user.UserId -ErrorAction SilentlyContinue
+        [pscustomobject]@{
+          UserPrincipalName = $user.UserPrincipalName
+          MethodCount       = $mfaMethods.Count
+          Methods           = ($mfaMethods | Select-Object -ExpandProperty AdditionalProperties).Keys -join ','
+        }
+      }
+    } -ContinueOnError | 
+      ForEach-Object { Write-CsvSafe -Object $_ -Path (Join-Path $validatedOutputPath 'Entra_MFA_Methods.csv') }
+  }
+
+  # Step 13: Generate summary reports
+  $summaryScores = Invoke-Step -Name 'Generate-Summary-Scores' -ScriptBlock {
+    [pscustomobject]@{
+      Category              = 'Licensing'
+      Score                 = if (@($users).Count -gt 0) { [int]((@($users | Where-Object { $_.HasCopilotAddOn }).Count / @($users).Count) * 100) } else { 0 }
+      Priority              = 'P0'
+      UserCount             = @($users).Count
+      CopilotAssigned       = @($users | Where-Object { $_.HasCopilotAddOn }).Count
+      SnapshotId            = $script:SnapshotId
+      RunDateUtc            = $script:RunDateUtc
+    }
+  }
+
+  Write-CsvSafe -Object $summaryScores -Path (Join-Path $validatedOutputPath 'Summary_Scores.csv')
+
+  # Step 14: Export run summary and cleanup
+  Invoke-Step -Name 'Export-Run-Summary' -ScriptBlock {
+    Write-CsvSafe -Object $script:Errors -Path (Join-Path $validatedOutputPath 'Run_Errors.csv')
+    Write-CsvSafe -Object $script:Warnings -Path (Join-Path $validatedOutputPath 'Run_Warnings.csv')
+    Write-CsvSafe -Object $script:Summary -Path (Join-Path $validatedOutputPath 'Run_Summary.csv')
+  } | Out-Null
+
+  # Cleanup: Clear SKU cache
+  Clear-SkuCache
+
+  # Cleanup: Disconnect all services
+  Disconnect-Safely -ConnectionType 'Graph'
+  if (-not $SkipExchange) {
+    Disconnect-Safely -ConnectionType 'Exchange'
+  }
+  if (-not $SkipSharePoint) {
+    Disconnect-Safely -ConnectionType 'PnP'
+  }
+
   Write-Log -Level Info -Step 'Main' -Message "Assessment completed successfully"
   Complete-ProgressIndicator
   
-  Write-Host "`nAssessment complete. Output path: $validatedOutputPath" -ForegroundColor Green
+  Write-Host "`nAssessment Complete!" -ForegroundColor Green
+  Write-Host "Output path: $validatedOutputPath" -ForegroundColor Green
+  Write-Host "Total steps executed: $($script:CurrentOperationStep) / $($script:TotalOperationSteps)" -ForegroundColor Cyan
+  Write-Host "Errors: $($script:Errors.Count), Warnings: $($script:Warnings.Count)" -ForegroundColor Cyan
 }
 catch {
   Write-Log -Level Error -Step 'Main' -Message ("Assessment failed: {0}" -f $_.Exception.Message)
   Write-Log -Level Error -Step 'Main' -Message ("Stack trace: {0}" -f ($_ | Out-String))
   
-  # Cleanup
-  Disconnect-Safely -ConnectionType 'Graph' -Step 'Error-Cleanup'
-  Disconnect-Safely -ConnectionType 'Exchange' -Step 'Error-Cleanup'
-  Clear-SkuCache
+  # Emergency cleanup
+  try {
+    Disconnect-Safely -ConnectionType 'Graph' -Step 'Error-Cleanup'
+    Disconnect-Safely -ConnectionType 'Exchange' -Step 'Error-Cleanup'
+    Disconnect-Safely -ConnectionType 'PnP' -Step 'Error-Cleanup'
+    Clear-SkuCache
+  }
+  catch {
+    Write-Log -Level Warn -Step 'Error-Cleanup' -Message ("Cleanup error: {0}" -f $_.Exception.Message)
+  }
   
   Complete-ProgressIndicator
+  Write-Host "`nAssessment Failed - Check logs for details" -ForegroundColor Red
   
   throw
 }
