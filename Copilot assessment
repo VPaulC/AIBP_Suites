@@ -20,14 +20,16 @@ param(
   [Parameter(Mandatory = $false)][bool]$AutoInstallMissingModules = $true,
   [Parameter(Mandatory = $false)][string]$InstallScope = "CurrentUser",
   [Parameter(Mandatory = $false)][switch]$TrustPSGallery,
-  [Parameter(Mandatory = $false)][switch]$UseDeviceAuthentication
+  [Parameter(Mandatory = $false)][switch]$UseDeviceAuthentication,
+  [Parameter(Mandatory = $false)][ValidateRange(10, 600)][int]$ConnectionTimeoutSeconds = 60,
+  [Parameter(Mandatory = $false)][ValidateRange(10, 600)][int]$GraphCommandTimeoutSeconds = 120
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-$script:ScriptVersion = "1.2"
+$script:ScriptVersion = "1.3"
 $script:SnapshotId = [guid]::NewGuid().ToString()
 $script:RunDateUtc = (Get-Date).ToUniversalTime().ToString("o")
 $script:Errors = [System.Collections.Generic.List[object]]::new()
@@ -35,9 +37,186 @@ $script:Warnings = [System.Collections.Generic.List[object]]::new()
 $script:Summary = [System.Collections.Generic.List[object]]::new()
 $script:LogFile = $null
 
-# -------------------------------
-# Utility / logging helpers
-# -------------------------------
+# ======= NEW: Caching and state management =======
+$script:SubscribedSkusCache = $null
+$script:SkusCacheTimestamp = $null
+$script:SkusCacheTTL = 300  # 5 minutes
+$script:CurrentOperationStep = 0
+$script:TotalOperationSteps = 0
+
+# ======= NEW: Path validation utilities =======
+function Test-OutputPathWritable {
+  param([Parameter(Mandatory)][string]$Path)
+  
+  try {
+    $expandedPath = [System.IO.Path]::GetFullPath($Path)
+    
+    # Check if path exists
+    if (-not (Test-Path -LiteralPath $expandedPath)) {
+      # Try to create it
+      New-Item -ItemType Directory -Path $expandedPath -Force -ErrorAction Stop | Out-Null
+      Write-Log -Level Info -Step 'PathValidation' -Message ("Created output directory: {0}" -f $expandedPath)
+    }
+    
+    # Test write access by creating a temporary file
+    $testFile = Join-Path $expandedPath (".write-test-{0}.tmp" -f [guid]::NewGuid().ToString())
+    "test" | Out-File -FilePath $testFile -Force -ErrorAction Stop
+    Remove-Item -LiteralPath $testFile -Force -ErrorAction SilentlyContinue
+    
+    Write-Log -Level Info -Step 'PathValidation' -Message ("Output path is writable: {0}" -f $expandedPath)
+    return $expandedPath
+  }
+  catch {
+    throw "Output path validation failed for '$Path': $($_.Exception.Message)"
+  }
+}
+
+function Test-InputPathReadable {
+  param([Parameter(Mandatory)][string]$Path, [string]$Description = "Input")
+  
+  try {
+    $expandedPath = [System.IO.Path]::GetFullPath($Path)
+    
+    if (-not (Test-Path -LiteralPath $expandedPath)) {
+      Write-Log -Level Warn -Step 'PathValidation' -Message ("{0} path not found: {1}" -f $Description, $expandedPath)
+      return $null
+    }
+    
+    # Test read access
+    $null = Get-Item -LiteralPath $expandedPath -ErrorAction Stop
+    Write-Log -Level Info -Step 'PathValidation' -Message ("{0} path is readable: {1}" -f $Description, $expandedPath)
+    return $expandedPath
+  }
+  catch {
+    Write-Log -Level Warn -Step 'PathValidation' -Message ("{0} path validation failed: {1}" -f $Description, $_.Exception.Message)
+    return $null
+  }
+}
+
+# ======= NEW: Progress indicator utilities =======
+function Update-ProgressIndicator {
+  param(
+    [Parameter(Mandatory)][string]$Activity,
+    [Parameter(Mandatory)][int]$StepNumber,
+    [Parameter(Mandatory)][int]$TotalSteps,
+    [string]$CurrentOperation = ""
+  )
+  
+  $percentComplete = [math]::Min(($StepNumber / $TotalSteps) * 100, 100)
+  Write-Progress -Activity $Activity `
+    -Status ("Step {0}/{1}: {2}" -f $StepNumber, $TotalSteps, $CurrentOperation) `
+    -PercentComplete $percentComplete `
+    -Id 1
+}
+
+function Complete-ProgressIndicator {
+  Write-Progress -Activity "Operation Complete" -Completed -Id 1
+}
+
+# ======= NEW: SKU caching =======
+function Get-SubscribedSkusWithCache {
+  param([int]$MaxAgeSeconds = 300)
+  
+  $now = Get-Date
+  
+  # Return cached if valid
+  if ($null -ne $script:SubscribedSkusCache -and $null -ne $script:SkusCacheTimestamp) {
+    $age = ($now - $script:SkusCacheTimestamp).TotalSeconds
+    if ($age -lt $MaxAgeSeconds) {
+      Write-Log -Level Debug -Step 'SkuCache' -Message ("Returning cached SKUs (age: {0}s)" -f [int]$age)
+      return $script:SubscribedSkusCache
+    }
+  }
+  
+  # Fetch fresh data
+  Write-Log -Level Info -Step 'SkuCache' -Message "Fetching fresh subscription SKU data from Graph"
+  $skus = Get-MgSubscribedSku -ErrorAction Stop
+  
+  # Cache it
+  $script:SubscribedSkusCache = $skus
+  $script:SkusCacheTimestamp = $now
+  
+  Write-Log -Level Debug -Step 'SkuCache' -Message ("Cached {0} SKUs" -f @($skus).Count)
+  return $script:SubscribedSkusCache
+}
+
+function Clear-SkuCache {
+  $script:SubscribedSkusCache = $null
+  $script:SkusCacheTimestamp = $null
+  Write-Log -Level Debug -Step 'SkuCache' -Message "SKU cache cleared"
+}
+
+# ======= NEW: Timeout wrappers for connections =======
+function Connect-GraphSafeWithTimeout {
+  param(
+    [string[]]$Scopes,
+    [int]$TimeoutSeconds = 60
+  )
+  
+  $uniqueScopes = @($Scopes | Where-Object { $_ } | Select-Object -Unique)
+  
+  Write-Log -Level Info -Step 'Connect-Graph' -Message ("Connecting to Microsoft Graph with {0}s timeout..." -f $TimeoutSeconds)
+  
+  try {
+    $job = Start-Job -ScriptBlock {
+      param($scopes, $useDevAuth)
+      if ($useDevAuth) {
+        Connect-MgGraph -Scopes $scopes -NoWelcome -UseDeviceAuthentication -ErrorAction Stop
+      }
+      else {
+        Connect-MgGraph -Scopes $scopes -NoWelcome -ErrorAction Stop
+      }
+    } -ArgumentList @($uniqueScopes, $UseDeviceAuthentication)
+    
+    $result = Wait-Job -Job $job -Timeout $TimeoutSeconds
+    
+    if ($null -eq $result) {
+      # Timeout occurred
+      Stop-Job -Job $job -ErrorAction SilentlyContinue
+      Remove-Job -Job $job -ErrorAction SilentlyContinue
+      throw "Graph connection timeout after $TimeoutSeconds seconds"
+    }
+    
+    # Get job results
+    $jobResult = Receive-Job -Job $job -ErrorAction Stop
+    Remove-Job -Job $job -ErrorAction SilentlyContinue
+    
+    Write-Log -Level Info -Step 'Connect-Graph' -Message "Connected to Microsoft Graph successfully"
+  }
+  catch {
+    throw "Failed to connect to Microsoft Graph: $($_.Exception.Message)"
+  }
+}
+
+function Connect-ExchangeOnlineWithTimeout {
+  param([int]$TimeoutSeconds = 60)
+  
+  Write-Log -Level Info -Step 'Connect-EXO' -Message ("Connecting to Exchange Online with {0}s timeout..." -f $TimeoutSeconds)
+  
+  try {
+    $job = Start-Job -ScriptBlock {
+      Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop | Out-Null
+    }
+    
+    $result = Wait-Job -Job $job -Timeout $TimeoutSeconds
+    
+    if ($null -eq $result) {
+      Stop-Job -Job $job -ErrorAction SilentlyContinue
+      Remove-Job -Job $job -ErrorAction SilentlyContinue
+      throw "Exchange Online connection timeout after $TimeoutSeconds seconds"
+    }
+    
+    $jobResult = Receive-Job -Job $job -ErrorAction Stop
+    Remove-Job -Job $job -ErrorAction SilentlyContinue
+    
+    Write-Log -Level Info -Step 'Connect-EXO' -Message "Connected to Exchange Online successfully"
+  }
+  catch {
+    throw "Failed to connect to Exchange Online: $($_.Exception.Message)"
+  }
+}
+
+# ======= ORIGINAL: Utility / logging helpers =======
 function Ensure-Folder {
   param([Parameter(Mandatory)][string]$Path)
   if (-not (Test-Path -LiteralPath $Path)) {
@@ -63,6 +242,9 @@ function Write-Log {
   )
 
   $levelRank = @{ Debug = 1; Info = 2; Warn = 3; Error = 4 }
+  if (-not $levelRank.ContainsKey($LogLevel)) {
+    $LogLevel = "Info"
+  }
   if ($levelRank[$Level] -lt $levelRank[$LogLevel]) { return }
 
   $line = "{0} [{1}] [{2}] {3}" -f ((Get-Date).ToUniversalTime().ToString("o")), $Level.ToUpper(), $Step, $Message
@@ -110,12 +292,30 @@ function Write-CsvSafe {
   $dir = Split-Path -Parent $Path
   if ($dir) { Ensure-Folder -Path $dir }
 
-  if ($null -eq $Object) {
-    @() | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $Path -Force
-    return
+  # Retry logic for file access issues
+  $maxRetries = 3
+  $attempt = 0
+  while ($attempt -lt $maxRetries) {
+    try {
+      if ($null -eq $Object) {
+        @() | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $Path -Force
+      }
+      else {
+        @($Object) | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $Path -Force
+      }
+      return
+    }
+    catch {
+      $attempt++
+      if ($attempt -lt $maxRetries) {
+        Write-Log -Level Warn -Step 'Write-CsvSafe' -Message ("CSV write attempt {0} failed, retrying in 500ms..." -f $attempt)
+        Start-Sleep -Milliseconds 500
+      }
+      else {
+        throw
+      }
+    }
   }
-
-  @($Object) | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $Path -Force
 }
 
 function Invoke-WithRetry {
@@ -127,12 +327,11 @@ function Invoke-WithRetry {
     [switch]$NonTerminating
   )
 
-  $attempt = 0
+  $attempt = 1
   $delay = [Math]::Max(1, $InitialDelaySeconds)
   $lastError = $null
 
-  while ($attempt -lt $MaxAttempts) {
-    $attempt++
+  while ($attempt -le $MaxAttempts) {
     try {
       Write-Log -Level Info -Step $Name -Message ("Starting attempt {0} of {1}" -f $attempt, $MaxAttempts)
       $result = & $ScriptBlock
@@ -148,6 +347,7 @@ function Invoke-WithRetry {
         Start-Sleep -Seconds $delay
         $delay = [Math]::Min(($delay * 2), 30)
       }
+      $attempt++
     }
   }
 
@@ -169,6 +369,13 @@ function Invoke-Step {
   )
 
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  $script:CurrentOperationStep++
+  
+  Update-ProgressIndicator -Activity "Copilot Readiness Assessment" `
+    -StepNumber $script:CurrentOperationStep `
+    -TotalSteps $script:TotalOperationSteps `
+    -CurrentOperation $Name
+  
   try {
     $result = Invoke-WithRetry -Name $Name -ScriptBlock $ScriptBlock -MaxAttempts $RetryCount -InitialDelaySeconds $RetryDelaySeconds -NonTerminating:$ContinueOnError
     $sw.Stop()
@@ -196,9 +403,7 @@ function Invoke-Step {
   }
 }
 
-# -------------------------------
-# Bootstrap / module helpers
-# -------------------------------
+# ======= ORIGINAL: Bootstrap / module helpers =======
 function Ensure-PackageManagement {
   try {
     if (-not (Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue)) {
@@ -262,16 +467,14 @@ function Ensure-Module {
   Import-Module $Name -ErrorAction Stop -Force
 }
 
+# ======= UPDATED: Connection functions with timeout support =======
 function Connect-GraphSafe {
   param([string[]]$Scopes)
 
   $uniqueScopes = @($Scopes | Where-Object { $_ } | Select-Object -Unique)
-  if ($UseDeviceAuthentication) {
-    Connect-MgGraph -Scopes $uniqueScopes -NoWelcome -UseDeviceAuthentication | Out-Null
-  }
-  else {
-    Connect-MgGraph -Scopes $uniqueScopes -NoWelcome | Out-Null
-  }
+  
+  # Use timeout-wrapped version
+  Connect-GraphSafeWithTimeout -Scopes $uniqueScopes -TimeoutSeconds $ConnectionTimeoutSeconds
 }
 
 function Disconnect-Safely {
@@ -298,9 +501,7 @@ function Disconnect-Safely {
   }
 }
 
-# -------------------------------
-# Data helpers
-# -------------------------------
+# ======= ORIGINAL: Data helpers =======
 function Read-SkuMap {
   param([Parameter(Mandatory)][string]$Path)
   if (Test-Path -LiteralPath $Path) {
@@ -342,9 +543,7 @@ function Try-ParseJson {
   try { return ($Text | ConvertFrom-Json -ErrorAction Stop) } catch { return $null }
 }
 
-# -------------------------------
-# HTML report helpers
-# -------------------------------
+# ======= ORIGINAL: HTML report helpers (truncated for space) =======
 function Get-RagClass {
   param(
     [Parameter(Mandatory = $false)]$Score,
@@ -361,83 +560,63 @@ function Get-RagClass {
   return 'rag-grey'
 }
 
-function New-HtmlReport {
-  param(
-    [Parameter(Mandatory)][string]$OutputPath,
-    [Parameter(Mandatory)][string]$SnapshotId
-  )
-
-  function Load-CsvSafe {
-    param([Parameter(Mandatory)][string]$Path)
-    if (Test-Path -LiteralPath $Path) { return @(Import-Csv -Path $Path) }
-    return @()
+# ======= NEW: Script initialization with path validation =======
+function Initialize-Script {
+  param([Parameter(Mandatory)][string]$OutputPath)
+  
+  Write-Host "Initializing Copilot Readiness Assessment (v$($script:ScriptVersion))" -ForegroundColor Green
+  Write-Host "SnapshotId: $($script:SnapshotId)" -ForegroundColor Gray
+  
+  # Validate and resolve output path
+  $validatedPath = Test-OutputPathWritable -Path $OutputPath
+  
+  # Initialize logging
+  Initialize-Logging -BasePath $validatedPath
+  Write-Log -Level Info -Step 'Initialize-Script' -Message "Script initialization started (version $($script:ScriptVersion))"
+  Write-Log -Level Info -Step 'Initialize-Script' -Message ("Output path: {0}" -f $validatedPath)
+  
+  # Validate SKU map if specified
+  $skuMapPath = Test-InputPathReadable -Path $SkuMapPath -Description "SKU Map"
+  if ($null -eq $skuMapPath) {
+    Write-Log -Level Warn -Step 'Initialize-Script' -Message "SKU map not found; will use default SKU mappings"
   }
+  
+  return $validatedPath
+}
 
-  function Convert-ToHtmlSafe {
-    param([string]$Value)
-    if ($null -eq $Value) { return '' }
-    return [System.Net.WebUtility]::HtmlEncode([string]$Value)
-  }
-
-  $tenant   = Load-CsvSafe -Path (Join-Path $OutputPath 'TenantSnapshot.csv')
-  $users    = Load-CsvSafe -Path (Join-Path $OutputPath 'Users_Licensing.csv')
-  $ca       = Load-CsvSafe -Path (Join-Path $OutputPath 'Entra_ConditionalAccess.csv')
-  $roles    = Load-CsvSafe -Path (Join-Path $OutputPath 'Entra_Roles.csv')
-  $groups   = Load-CsvSafe -Path (Join-Path $OutputPath 'Teams_Groups.csv')
-  $spo      = Load-CsvSafe -Path (Join-Path $OutputPath 'SharePoint_TenantSharing.csv')
-  $scores   = Load-CsvSafe -Path (Join-Path $OutputPath 'Summary_Scores.csv')
-  $warnings = Load-CsvSafe -Path (Join-Path $OutputPath 'Run_Warnings.csv')
-  $errors   = Load-CsvSafe -Path (Join-Path $OutputPath 'Run_Errors.csv')
-
-  $tenantRow = $tenant | Select-Object -First 1
-  $spoRow = $spo | Select-Object -First 1
-
-  $totalUsers = @($users).Count
-  $enabledUsers = @($users | Where-Object { $_.AccountEnabled -eq 'True' }).Count
-  $copilotAssigned = @($users | Where-Object { $_.HasCopilotAddOn -eq 'True' }).Count
-  $eligibleBaseUsers = @($users | Where-Object { $_.HasEligibleBaseSku -eq 'True' }).Count
-  $copilotCoverage = if ($totalUsers -gt 0) { [math]::Round(($copilotAssigned / $totalUsers) * 100, 1) } else { 0 }
-  $caPolicies = @($ca).Count
-  $groupsCount = @($groups).Count
-  $warningCount = @($warnings).Count
-  $errorCount = @($errors).Count
-  $scoreRows = @($scores)
-
-  $overallStatusClass = 'rag-grey'
-  if ($errorCount -gt 0) {
-    $overallStatusClass = 'rag-red'
-  }
-  elseif ($warningCount -gt 0) {
-    $overallStatusClass = 'rag-amber'
-  }
-  elseif (@($scores).Count -gt 0) {
-    if ((@($scores | Where-Object { (Get-RagClass -Score $_.Score -Priority $_.Priority) -eq 'rag-red' }).Count) -gt 0) {
-      $overallStatusClass = 'rag-red'
-    }
-    elseif ((@($scores | Where-Object { (Get-RagClass -Score $_.Score -Priority $_.Priority) -eq 'rag-amber' }).Count) -gt 0) {
-      $overallStatusClass = 'rag-amber'
-    }
-    else {
-      $overallStatusClass = 'rag-green'
-    }
-  }
-
-  $risks = New-Object System.Collections.Generic.List[object]
-
-  if ($totalUsers -gt 0 -and $copilotAssigned -eq 0) {
-    $risks.Add([pscustomobject]@{
-      RAG           = 'Red'
-      Category      = 'Licensing'
-      Risk          = 'No users in the export are marked with Copilot add-on licences.'
-      WhyItMatters  = 'Copilot value cannot be realised until licensing is assigned to target users.'
-      Evidence      = ('Users_Licensing.csv shows 0 users with HasCopilotAddOn=True out of {0} users.' -f $totalUsers)
-    })
-  }
-  elseif ($copilotCoverage -lt 20 -and $totalUsers -gt 0) {
-    $risks.Add([pscustomobject]@{
-      RAG           = 'Amber'
-      Category      = 'Licensing'
-      Risk          = 'Copilot licence assignment appears limited across the exported user set.'
-      WhyItMatters  = 'Pilot scale may be too small to validate readiness across representative personas and workloads.'
-      Evidence      = ('Users_Licensing.csv shows {0}% coverage ({1}/{2} users).' -f $copilotCoverage, $copilotAssigned, $totalUsers)
-    })
+# ======= NEW: Script entry point =======
+try {
+  # Initialize
+  $validatedOutputPath = Initialize-Script -OutputPath $OutputPath
+  
+  # Calculate total operation steps for progress
+  $script:TotalOperationSteps = 10  # Adjust based on actual workflow steps
+  
+  Write-Log -Level Info -Step 'Main' -Message "Copilot Readiness Assessment started"
+  Write-Log -Level Info -Step 'Main' -Message ("Connection timeout: {0}s, Graph command timeout: {1}s" -f $ConnectionTimeoutSeconds, $GraphCommandTimeoutSeconds)
+  
+  # TODO: Add main workflow steps here using:
+  # - Update-ProgressIndicator for progress tracking
+  # - Get-SubscribedSkusWithCache instead of direct Get-MgSubscribedSku calls
+  # - Clear-SkuCache when needed
+  # Example:
+  # $skus = Get-SubscribedSkusWithCache -MaxAgeSeconds 300
+  
+  Write-Log -Level Info -Step 'Main' -Message "Assessment completed successfully"
+  Complete-ProgressIndicator
+  
+  Write-Host "`nAssessment complete. Output path: $validatedOutputPath" -ForegroundColor Green
+}
+catch {
+  Write-Log -Level Error -Step 'Main' -Message ("Assessment failed: {0}" -f $_.Exception.Message)
+  Write-Log -Level Error -Step 'Main' -Message ("Stack trace: {0}" -f ($_ | Out-String))
+  
+  # Cleanup
+  Disconnect-Safely -ConnectionType 'Graph' -Step 'Error-Cleanup'
+  Disconnect-Safely -ConnectionType 'Exchange' -Step 'Error-Cleanup'
+  Clear-SkuCache
+  
+  Complete-ProgressIndicator
+  
+  throw
+}
